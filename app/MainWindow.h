@@ -267,7 +267,7 @@ private:
   BGroupView *fFilterGroup = nullptr;
   bool fIsFilterGroupVisible = true;
 
-  bool fShowTooltips = false;
+  bool fShowTooltips = true;
   BMenuItem *fTooltipsOnItem = nullptr;
   BMenuItem *fTooltipsOffItem = nullptr;
 

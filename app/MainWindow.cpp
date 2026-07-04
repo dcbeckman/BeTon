@@ -655,7 +655,7 @@ void MainWindow::_BuildUI() {
       new BMenuItem(B_TRANSLATE("On"), new BMessage(MSG_TOOLTIPS_ON));
   fTooltipsOffItem =
       new BMenuItem(B_TRANSLATE("Off"), new BMessage(MSG_TOOLTIPS_OFF));
-  fTooltipsOffItem->SetMarked(true);
+  fTooltipsOnItem->SetMarked(true);
   tooltipsMenu->AddItem(fTooltipsOnItem);
   tooltipsMenu->AddItem(fTooltipsOffItem);
   fSettingsMenu->AddItem(tooltipsMenu);

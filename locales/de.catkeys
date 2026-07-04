@@ -118,7 +118,7 @@ File not found.	PlaybackQueueManager		Datei nicht gefunden.
 No results found.	MetadataPropertiesWindow		Keine Ergebnisse gefunden.
 Error: Release ID not found.	MusicBrainzLookupController		Fehler: Release-ID nicht gefunden.
 Generate Playlist	SmartPlaylistGeneratorWindow		Playlist erstellen
-Match SeekBar	MainWindow		SeekBar anpassen
+Match SeekBar	MainWindow		SeekBar-Farbe
 Move failed: source file not found	LibraryController		Verschieben fehlgeschlagen: Quelldatei nicht gefunden
 Ready.	MusicBrainzLookupController		Bereit.
 Buffering audio stream...	RadioStationController		Puffere Audiostream...
