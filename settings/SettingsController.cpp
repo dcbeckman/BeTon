@@ -3,6 +3,10 @@
 #include "Config.h"
 #include "MediaTableView.h"
 #include "DLNAViewController.h"
+#if ENABLE_LOCAL_OUTPUT
+#include "OutputViewController.h"
+#include "AudioPlaybackEngine.h"
+#endif
 #include "DLNAService.h"
 #include "NowPlayingInfoPanel.h"
 #include "LibraryBrowserController.h"
@@ -103,6 +107,16 @@ void SettingsController::SaveSettingsToMessage(BMessage &state) {
   state.AddBool("dlna_enabled", fWindow->fDlnaEnabled);
 #if ENABLE_DLNA_OUTPUT
   state.AddBool("show_renderer_btn", fWindow->fShowRendererBtn);
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  state.AddBool("show_local_output_btn", fWindow->fShowLocalOutputBtn);
+  if (fWindow->fLocalOutputController) {
+    state.AddInt32("local_output_target", (int32)fWindow->fPlaybackEngine->LocalOutputTarget());
+    state.AddString("local_output_device", fWindow->fPlaybackEngine->LocalOutputBus().deviceName);
+    state.AddString("local_output_bus", fWindow->fPlaybackEngine->LocalOutputBus().busName);
+    state.AddInt32("local_output_policy", (int32)fWindow->fLocalOutputController->Policy());
+    state.AddString("local_output_fallback", fWindow->fLocalOutputController->FallbackDevice());
+  }
 #endif
 
   BString mode = "Library";
@@ -271,6 +285,47 @@ void SettingsController::LoadSettingsFromMessage(BMessage &state) {
   state.FindString("active_view_mode", &fWindow->fInitialViewMode);
   state.FindString("active_playlist_name", &fWindow->fInitialPlaylistName);
   state.FindString("active_dlna_uuid", &fWindow->fInitialDlnaUuid);
+
+#if ENABLE_LOCAL_OUTPUT
+  state.FindBool("show_local_output_btn", &fWindow->fShowLocalOutputBtn);
+  
+  int32 targetVal = 0;
+  if (state.FindInt32("local_output_target", &targetVal) == B_OK) {
+    OutputTarget target = (OutputTarget)targetVal;
+    BString deviceName;
+    BString busName;
+    state.FindString("local_output_device", &deviceName);
+    state.FindString("local_output_bus", &busName);
+    
+    int32 policyVal = 0;
+    MixerConflictPolicy policy = MixerConflictPolicy::Disconnect;
+    if (state.FindInt32("local_output_policy", &policyVal) == B_OK) {
+      policy = (MixerConflictPolicy)policyVal;
+    }
+    BString fallbackDevice;
+    state.FindString("local_output_fallback", &fallbackDevice);
+    
+    if (fWindow->fLocalOutputController) {
+      fWindow->fLocalOutputController->SetPolicyAndFallback(policy, fallbackDevice);
+      
+      if (target != OutputTarget::SystemDefault) {
+        std::vector<OutputBusInfo> devices;
+        fWindow->fLocalOutputController->OutputManager().Enumerate(devices);
+        bool resolved = false;
+        for (const auto& dev : devices) {
+          if (dev.deviceName == deviceName && dev.busName == busName) {
+            fWindow->fPlaybackEngine->SetOutputDevice(target, dev, policy, fallbackDevice);
+            resolved = true;
+            break;
+          }
+        }
+        if (!resolved) {
+          fWindow->fPlaybackEngine->SetOutputDevice(OutputTarget::SystemDefault, OutputBusInfo(), policy, fallbackDevice);
+        }
+      }
+    }
+  }
+#endif
 }
 
 /**

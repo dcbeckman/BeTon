@@ -3,6 +3,9 @@
 #include "MediaTableView.h"
 #include "DLNAMessageHandler.h"
 #include "DLNAViewController.h"
+#if ENABLE_LOCAL_OUTPUT
+#include "OutputViewController.h"
+#endif
 #include "DLNAService.h"
 #include "Debug.h"
 #include "MusicSourceManagerWindow.h"
@@ -39,6 +42,7 @@
 #include "ViewStateController.h"
 
 #include <AboutWindow.h>
+#include <Alert.h>
 #include <Autolock.h>
 #include <Button.h>
 #include <ColumnTypes.h>
@@ -112,6 +116,44 @@ bool MainWindow::_HandleRadioMessage(BMessage *msg) {
 bool MainWindow::_HandleDlnaMessage(BMessage *msg) {
   return fDlnaCommandHandler && fDlnaCommandHandler->HandleMessage(msg);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+bool MainWindow::_HandleLocalOutputMessage(BMessage *msg) {
+  if (!fLocalOutputController || !msg)
+    return false;
+
+  switch (msg->what) {
+  case MSG_SHOW_LOCAL_OUTPUT_MENU:
+    fLocalOutputController->ShowLocalOutputMenu();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_SELECTED:
+    fLocalOutputController->SelectLocalOutput(msg);
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH:
+    fLocalOutputController->RefreshDevices();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH + 100: // Toggle local output button
+    fLocalOutputController->ToggleLocalOutputButton();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH + 101: // Trigger settings save
+    SaveSettings();
+    return true;
+
+  case MSG_CONFLICT_POLICY_CHANGED:
+    fLocalOutputController->SetConflictPolicy(msg);
+    return true;
+
+  case MSG_FALLBACK_DEVICE_CHANGED:
+    fLocalOutputController->SetFallbackDevice(msg);
+    return true;
+  }
+  return false;
+}
+#endif
 
 bool MainWindow::_HandleStatusAndSearchMessage(BMessage *msg) {
   return fStatusBarController && fStatusBarController->HandleMessage(msg);
@@ -402,6 +444,9 @@ MainWindow::MainWindow()
   fRadioStationController = new RadioStationController(this);
   fRadioMessageHandler = new RadioMessageHandler(this);
   fDlnaController = new DLNAViewController(this);
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputController = new OutputViewController(this);
+#endif
   fDlnaCommandHandler = new DLNAMessageHandler(this);
   fSettingsController = new SettingsController(this);
   fStatusBarController = new StatusBarController(this);
@@ -449,6 +494,35 @@ MainWindow::MainWindow()
   if (fDlnaController)
     fDlnaController->RebuildRendererMenu();
   fLocalServer.Start();
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputController)
+    fLocalOutputController->RebuildOutputMenu();
+
+  BString breadcrumbPath;
+  BPath bPath;
+  if (find_directory(B_USER_SETTINGS_DIRECTORY, &bPath) == B_OK) {
+    bPath.Append("Beton");
+    bPath.Append("output_breadcrumb");
+    breadcrumbPath = bPath.Path();
+  }
+  if (!breadcrumbPath.IsEmpty() && BEntry(breadcrumbPath.String()).Exists()) {
+    BAlert* alert = new BAlert("Recovery",
+        B_TRANSLATE("Beton exited uncleanly while using direct local audio output. "
+                    "The system mixer output might still be redirected to that device.\n\n"
+                    "Do you want to restore system audio routing to its original settings?"),
+        B_TRANSLATE("No, keep current"),
+        B_TRANSLATE("Yes, restore settings"),
+        nullptr, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+    alert->SetShortcut(0, B_ESCAPE);
+    int32 response = alert->Go();
+    if (response == 1) {
+      AudioOutputManager mgr;
+      mgr.RecoverFromBreadcrumb();
+    } else {
+      unlink(breadcrumbPath.String());
+    }
+  }
 #endif
 
   AddCommonFilter(new WindowClickFilter(this));
@@ -506,6 +580,9 @@ MainWindow::~MainWindow() {
   delete fRadioStationLibrary;
   delete fDlnaCommandHandler;
   delete fDlnaController;
+#if ENABLE_LOCAL_OUTPUT
+  delete fLocalOutputController;
+#endif
   delete fDlnaManager;
   delete fLibraryMessageHandler;
   delete fViewMessageHandler;
@@ -531,6 +608,9 @@ MainWindow::~MainWindow() {
   if (fOutputMenuItem && fOutputMenuItem->Menu() == nullptr)
     delete fOutputMenuItem;
   delete fIconRenderer;
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  delete fIconLocalOutput;
 #endif
 }
 
@@ -609,6 +689,11 @@ void MainWindow::_BuildUI() {
   fSettingsMenu->AddItem(fToggleDlnaItem);
 #if ENABLE_DLNA_OUTPUT
   _SetOutputMenuVisible(fDlnaEnabled);
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputSettingsMenu = new BMenu(B_TRANSLATE("Output Device"));
+  fLocalOutputSettingsMenuItem = new BMenuItem(fLocalOutputSettingsMenu);
+  fSettingsMenu->AddItem(fLocalOutputSettingsMenuItem);
 #endif
   fSettingsMenu->AddSeparatorItem();
 
@@ -771,6 +856,19 @@ void MainWindow::_BuildUI() {
   fBtnRenderer->SetExplicitSize(buttonSize);
 #endif
 
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputMenu = new BPopUpMenu("");
+  fLocalOutputMenu->SetTargetForItems(this);
+
+  fBtnLocalOutput = new BButton("", new BMessage(MSG_SHOW_LOCAL_OUTPUT_MENU));
+  fIconLocalOutput = LoadIconFromResource(1006, iconSize);
+  if (fIconLocalOutput)
+    fBtnLocalOutput->SetIcon(fIconLocalOutput, 0);
+  fBtnLocalOutput->SetExplicitSize(buttonSize);
+  if (!fShowLocalOutputBtn)
+    fBtnLocalOutput->Hide();
+#endif
+
   BScrollView *playlistScroll = new BScrollView(
       "playlist_scroll", fPlaylistLibrary->View(), B_WILL_DRAW, false, true);
   playlistScroll->SetExplicitMinSize(BSize(0, 0));
@@ -831,6 +929,10 @@ void MainWindow::_BuildUI() {
       .AddStrut(kItemSpacing)
       .Add(fBtnRenderer)
 #endif
+#if ENABLE_LOCAL_OUTPUT
+      .AddStrut(kItemSpacing)
+      .Add(fBtnLocalOutput)
+#endif
       .AddStrut(kItemSpacing)
       .Add(fDlnaServerField)
       .AddGlue()
@@ -861,6 +963,12 @@ void MainWindow::WindowActivated(bool active) {
     if (fLibraryManager && fLibraryManager->ContentView()) {
       fLibraryManager->ContentView()->CommitCellEdit();
     }
+  } else {
+#if ENABLE_LOCAL_OUTPUT
+    if (fLocalOutputController) {
+      fLocalOutputController->RebuildOutputMenu();
+    }
+#endif
   }
 }
 
@@ -890,6 +998,11 @@ void MainWindow::MessageReceived(BMessage *msg) {
 
   if (_HandleDlnaMessage(msg))
     return;
+
+#if ENABLE_LOCAL_OUTPUT
+  if (_HandleLocalOutputMessage(msg))
+    return;
+#endif
 
   if (_HandleStatusAndSearchMessage(msg))
     return;

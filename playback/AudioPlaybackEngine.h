@@ -3,6 +3,9 @@
 
 #include "Config.h"
 #include "Messages.h"
+#if ENABLE_LOCAL_OUTPUT
+#include "AudioOutputManager.h"
+#endif
 
 #include <Autolock.h>
 #include <Locker.h>
@@ -38,6 +41,14 @@ public:
 
 #if ENABLE_DLNA_OUTPUT
   void SetRemoteOutputManagers(DLNAService *dlna, LocalFileHttpServer *localServer);
+#endif
+
+#if ENABLE_LOCAL_OUTPUT
+  void SetOutputDevice(OutputTarget target, const OutputBusInfo& bus, MixerConflictPolicy policy, const BString& fallbackDeviceName);
+  OutputTarget LocalOutputTarget() const { return fLocalOutputTarget; }
+  OutputBusInfo LocalOutputBus() const { return fLocalOutputBus; }
+  MixerConflictPolicy LocalConflictPolicy() const { return fLocalConflictPolicy; }
+  BString LocalFallbackDevice() const { return fLocalFallbackDevice; }
 #endif
 
   /**
@@ -139,7 +150,10 @@ private:
   ///@{
   std::atomic<bigtime_t> fCurrentPos{0};
   bigtime_t fDuration = 0;
-  float fVolume = 1.0f;
+  // Atomic: read on the real-time audio thread (software volume in _ApplyFade)
+  // while written on the control thread. std::atomic<float> provides implicit
+  // load/store, so existing use-sites are unchanged.
+  std::atomic<float> fVolume{1.0f};
   std::atomic<int32> fCurrentBitrate{0};
   std::atomic<int32> fCurrentSampleRate{0};
   std::atomic<int32> fCurrentChannels{0};
@@ -170,6 +184,17 @@ private:
 
   BPrivate::Network::BUrlContext fUrlContext;
   BLocker fPlayLock;
+
+  BUrl fCurrentUrl;
+  BString fCurrentTitle;
+
+#if ENABLE_LOCAL_OUTPUT
+  AudioOutputManager fLocalOutputManager;
+  OutputTarget fLocalOutputTarget = OutputTarget::SystemDefault;
+  OutputBusInfo fLocalOutputBus;
+  MixerConflictPolicy fLocalConflictPolicy = MixerConflictPolicy::Disconnect;
+  BString fLocalFallbackDevice;
+#endif
 
 #if ENABLE_DLNA_OUTPUT
   DLNAService *fDlnaManager = nullptr;

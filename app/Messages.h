@@ -206,6 +206,10 @@
 #define MSG_DLNA_REFRESH_CACHE   'dlrc'  ///< Invalidate and rebuild server cache.
 #define MSG_DLNA_RESOURCE_UNAVAILABLE 'dlru' ///< DLNA resource cannot be played.
 #define MSG_MUTE_TOGGLE          'mute'  ///< Toggle audio mute.
+#define MSG_LOCAL_OUTPUT_SELECTED 'lcos' ///< User selected local output target/bus.
+#define MSG_LOCAL_OUTPUT_REFRESH 'lcor'  ///< Refresh local output devices.
+#define MSG_CONFLICT_POLICY_CHANGED 'cplc' ///< On System Mixer Conflict policy changed.
+#define MSG_FALLBACK_DEVICE_CHANGED 'fbdc' ///< Fallback device for conflict changed.
 ///@}
 
 #endif // BETON_MESSAGES_H

@@ -41,6 +41,7 @@ class BGroupView;
 class ArtworkController;
 class DLNAMessageHandler;
 class DLNAViewController;
+class OutputViewController;
 class LibraryMessageHandler;
 class LibraryController;
 class MetadataMessageHandler;
@@ -133,6 +134,7 @@ private:
   friend class ArtworkController;
   friend class DLNAMessageHandler;
   friend class DLNAViewController;
+  friend class OutputViewController;
   friend class LibraryMessageHandler;
   friend class LibraryController;
   friend class MetadataMessageHandler;
@@ -161,6 +163,9 @@ private:
   bool _HandlePlaylistMessage(BMessage* msg);
   bool _HandleRadioMessage(BMessage* msg);
   bool _HandleDlnaMessage(BMessage* msg);
+#if ENABLE_LOCAL_OUTPUT
+  bool _HandleLocalOutputMessage(BMessage* msg);
+#endif
   bool _HandleStatusAndSearchMessage(BMessage* msg);
   bool _HandleSyncMessage(BMessage* msg);
   bool _HandleMetadataMessage(BMessage* msg);
@@ -249,6 +254,13 @@ private:
   BButton *fBtnRenderer{nullptr};
   BPopUpMenu *fRendererMenu{nullptr};
 #endif
+#if ENABLE_LOCAL_OUTPUT
+  BButton *fBtnLocalOutput{nullptr};
+  BPopUpMenu *fLocalOutputMenu{nullptr};
+  BMenu *fLocalOutputSettingsMenu{nullptr};
+  BMenuItem *fLocalOutputSettingsMenuItem{nullptr};
+  bool fShowLocalOutputBtn{true};
+#endif
   BMenuField *fDlnaServerField{nullptr};
   BPopUpMenu *fDlnaServerMenu{nullptr};
 
@@ -310,6 +322,9 @@ private:
 #if ENABLE_DLNA_OUTPUT
   BBitmap *fIconRenderer{nullptr};
 #endif
+#if ENABLE_LOCAL_OUTPUT
+  BBitmap *fIconLocalOutput{nullptr};
+#endif
 
   ///@}
 
@@ -362,6 +377,9 @@ private:
   DLNAService *fDlnaManager;
   DLNAMessageHandler *fDlnaCommandHandler{nullptr};
   DLNAViewController *fDlnaController{nullptr};
+#if ENABLE_LOCAL_OUTPUT
+  OutputViewController *fLocalOutputController{nullptr};
+#endif
   ViewMessageHandler *fViewMessageHandler{nullptr};
   ViewStateController *fViewStateController{nullptr};
   LocalFileHttpServer fLocalServer;
@@ -371,6 +389,10 @@ private:
   static const uint32 MSG_TOGGLE_RADIO = 'tgRd';
   static const uint32 MSG_TOGGLE_DLNA = 'tgDl';
   static const uint32 MSG_TOGGLE_RENDERER_BTN = 'tgRB';
+#if ENABLE_LOCAL_OUTPUT
+  static const uint32 MSG_SHOW_LOCAL_OUTPUT_MENU = 'shLO';
+  static const uint32 MSG_TOGGLE_LOCAL_OUTPUT_BTN = 'tgLO';
+#endif
   ///@}
 
   /** @name Message Runners (Timers) */

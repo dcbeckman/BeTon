@@ -5,6 +5,10 @@
 #include "Messages.h"
 #include "NetworkAudioStreamIO.h"
 
+#if ENABLE_LOCAL_OUTPUT
+#include "AudioOutputManager.h"
+#endif
+
 #include <Entry.h>
 #include <File.h>
 #include <Message.h>
@@ -296,6 +300,9 @@ void AudioPlaybackEngine::_CleanupMedia() {
     delete fNetworkStream;
     fNetworkStream = nullptr;
   }
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputManager.Release();
+#endif
 }
 
 /**
@@ -337,7 +344,13 @@ void AudioPlaybackEngine::SetVolume(float vol) {
 #endif
 
   if (fPlayer) {
+#if ENABLE_LOCAL_OUTPUT
+    if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+      fPlayer->SetVolume(fVolume);
+    }
+#else
     fPlayer->SetVolume(fVolume);
+#endif
   }
   if (fMidiSynth) {
     fMidiSynth->SetVolume(fVolume);
@@ -379,7 +392,15 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
     fadeOut = totalFrames;
     fFadeOutFrames.store(fadeOut, std::memory_order_relaxed);
   }
-  if (fadeIn <= 0 && fadeOut <= 0)
+
+  bool needSoftwareVolume = false;
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    needSoftwareVolume = true;
+  }
+#endif
+
+  if (fadeIn <= 0 && fadeOut <= 0 && !needSoftwareVolume)
     return;
 
   auto gainForFrame = [&](int64 frame) {
@@ -388,6 +409,11 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
       gain *= static_cast<float>(totalFrames - fadeIn + frame) / totalFrames;
     if (fadeOut > 0)
       gain *= static_cast<float>(fadeOut - frame) / totalFrames;
+
+    if (needSoftwareVolume) {
+      gain *= fVolume;
+    }
+
     if (gain < 0.0f)
       return 0.0f;
     if (gain > 1.0f)
@@ -696,14 +722,75 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
               raf.byte_order == B_MEDIA_BIG_ENDIAN ? "BE" : "LE",
               (long)raf.buffer_size);
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    media_node node;
+    media_input input;
+    status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
+    if (acquireStatus == B_OK) {
+      // Leave the format wildcarded so the connection negotiates to the
+      // device/bus's supported format instead of forcing the file's format.
+      // A rate-fixed device (e.g. 48 kHz only) would otherwise fail to
+      // connect on a 44.1 kHz file. After connecting we re-init the decoder
+      // to the negotiated format so the media plugins resample (refinement A).
+      media_multi_audio_format format = media_multi_audio_format::wildcard;
+
+      fPlayer = new BSoundPlayer(node, &format, "Orchester", &input, &_PlayBuffer, NULL, this);
+
+      if (fPlayer && fPlayer->InitCheck() == B_OK) {
+        // media_format::u.raw_audio is a media_multi_audio_format (derived);
+        // wildcard it, then copy the negotiated raw_audio base fields into it.
+        media_format trackFormat;
+        trackFormat.type = B_MEDIA_RAW_AUDIO;
+        trackFormat.u.raw_audio = media_multi_audio_format::wildcard;
+        static_cast<media_raw_audio_format&>(trackFormat.u.raw_audio) = fPlayer->Format();
+        fTrack->DecodedFormat(&trackFormat);
+
+        fCurrentSampleRate.store(fPlayer->Format().frame_rate);
+        fCurrentChannels.store(fPlayer->Format().channel_count);
+      } else {
+        // Direct connection failed (e.g. device rejected the format).
+        // Release the device (restores the mixer) and fall back to default.
+        DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        delete fPlayer;
+        fPlayer = nullptr;
+        fLocalOutputManager.Release();
+        if (fTarget.IsValid()) {
+          BMessage errMsg(MSG_STATUS_UPDATE);
+          errMsg.AddString("text", "Device unavailable, falling back to system default");
+          fTarget.SendMessage(&errMsg);
+        }
+        fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+      }
+    } else {
+      DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      if (fTarget.IsValid()) {
+        BMessage errMsg(MSG_STATUS_UPDATE);
+        errMsg.AddString("text", "Device in use, falling back to system default");
+        fTarget.SendMessage(&errMsg);
+      }
+      fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+    }
+  } else {
+    fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+  }
+#else
   fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
-  if (!fPlayer) {
-    DEBUG_PRINT("BSoundPlayer new failed\n");
+#endif
+
+  if (!fPlayer || fPlayer->InitCheck() != B_OK) {
+    DEBUG_PRINT("BSoundPlayer new/init failed\n");
     _CleanupMedia();
     return;
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+    fPlayer->SetVolume(fVolume);
+  }
+#else
   fPlayer->SetVolume(fVolume);
+#endif
   _BeginFadeIn();
 
   fPlayer->Start();
@@ -740,6 +827,8 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+  fCurrentUrl = url;
+  fCurrentTitle = title ? title : "";
 
   BAutolock lock(fPlayLock);
   DEBUG_PRINT("PlayUrl(%s, duration=%ld) called\n",
@@ -803,6 +892,19 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
   fNetworkStream =
       new NetworkAudioStreamIO(fTarget, context ? context : &fUrlContext);
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (roster && roster->GetFormatFor(fLocalOutputBus.input, &fmt) == B_OK) {
+      if (fmt.type == B_MEDIA_RAW_AUDIO) {
+        fNetworkStream->SetTargetFormat(fmt.u.raw_audio.frame_rate, fmt.u.raw_audio.channel_count);
+      }
+    }
+  }
+#endif
+
   NetworkAudioStreamIO::Mode mode = NetworkAudioStreamIO::MODE_ICY;
   if (url.UrlString().IEndsWith(".m3u8"))
     mode = NetworkAudioStreamIO::MODE_HLS;
@@ -855,14 +957,68 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
                 prebufferBytes, (long)prebufferStatus);
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    media_node node;
+    media_input input;
+    status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
+    if (acquireStatus == B_OK) {
+      // Wildcard the format so the connection negotiates to the device's
+      // supported format rather than forcing the stream's format (see Play()).
+      media_multi_audio_format format = media_multi_audio_format::wildcard;
+
+      fPlayer = new BSoundPlayer(node, &format, "Orchester", &input, &_PlayBuffer, NULL, this);
+
+      if (fPlayer && fPlayer->InitCheck() == B_OK) {
+        // NOTE: the stream's resample target was already set before Open()
+        // (via GetFormatFor(bus.input) above), so WaitForFormat() returned the
+        // bus-format raf and the wildcard connection negotiates to match it.
+        // We only refresh the display fields here.
+        media_raw_audio_format pf = fPlayer->Format();
+        fCurrentSampleRate.store(pf.frame_rate);
+        fCurrentChannels.store(pf.channel_count);
+      } else {
+        // Direct connection failed; release the device and fall back.
+        DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        delete fPlayer;
+        fPlayer = nullptr;
+        fLocalOutputManager.Release();
+        if (fTarget.IsValid()) {
+          BMessage errMsg(MSG_STATUS_UPDATE);
+          errMsg.AddString("text", "Device unavailable, falling back to system default");
+          fTarget.SendMessage(&errMsg);
+        }
+        fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+      }
+    } else {
+      DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      if (fTarget.IsValid()) {
+        BMessage errMsg(MSG_STATUS_UPDATE);
+        errMsg.AddString("text", "Device in use, falling back to system default");
+        fTarget.SendMessage(&errMsg);
+      }
+      fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+    }
+  } else {
+    fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+  }
+#else
   fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
-  if (!fPlayer) {
+#endif
+
+  if (!fPlayer || fPlayer->InitCheck() != B_OK) {
     _CleanupMedia();
     fIsStreaming.store(false, std::memory_order_relaxed);
     return;
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+    fPlayer->SetVolume(fVolume);
+  }
+#else
   fPlayer->SetVolume(fVolume);
+#endif
   _BeginFadeIn();
   fPlayer->Start();
   fPlayer->SetHasData(true);
@@ -1361,3 +1517,58 @@ void AudioPlaybackEngine::_PlayBuffer(
 
   self->fInCallback.store(false, std::memory_order_relaxed);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+void AudioPlaybackEngine::SetOutputDevice(OutputTarget target,
+                                         const OutputBusInfo& bus,
+                                         MixerConflictPolicy policy,
+                                         const BString& fallbackDeviceName) {
+  BAutolock lock(fPlayLock);
+
+  if (fLocalOutputTarget == target &&
+      fLocalConflictPolicy == policy &&
+      fLocalFallbackDevice == fallbackDeviceName &&
+      (target == OutputTarget::SystemDefault ||
+       (fLocalOutputBus.deviceName == bus.deviceName &&
+        fLocalOutputBus.busName == bus.busName))) {
+    return;
+  }
+
+  DEBUG_PRINT("SetOutputDevice called, switching output...\n");
+
+  bool wasPlaying = IsPlaying();
+  bool wasPaused = IsPaused();
+  bigtime_t currentPos = fCurrentPos.load();
+  bool isStream = IsStreaming();
+  BUrl savedUrl = fCurrentUrl;
+  BString savedTitle = fCurrentTitle;
+  size_t savedIdx = fCurrentIdx.load();
+
+  // 1. Stop current playback to release player and output manager node resources
+  _StopLocked(true);
+
+  // 2. Apply new parameters
+  fLocalOutputTarget = target;
+  fLocalOutputBus = bus;
+  fLocalConflictPolicy = policy;
+  fLocalFallbackDevice = fallbackDeviceName;
+
+  // 3. Resume if we were playing or paused
+  if (wasPlaying || wasPaused) {
+    if (isStream) {
+      PlayUrl(savedUrl, savedTitle);
+      if (wasPaused) {
+        Pause();
+      }
+    } else {
+      Play(savedIdx);
+      if (currentPos > 0) {
+        SeekTo(currentPos);
+      }
+      if (wasPaused) {
+        Pause();
+      }
+    }
+  }
+}
+#endif

@@ -12,4 +12,7 @@
 /// Enable/Disable MIDI file support (.mid/.midi scanning and playback)
 #define ENABLE_MIDI_PLAYBACK 0
 
+/// Enable/Disable local audio output device selection (physical device / bus routing)
+#define ENABLE_LOCAL_OUTPUT 1
+
 #endif // BETON_CONFIG_H
