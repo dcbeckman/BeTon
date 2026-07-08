@@ -66,9 +66,9 @@ private:
     bool fAlteredSystem;
     MixerConflictPolicy fAlteredPolicy;
     
-    // For Disconnect policy restore
-    media_output fSavedMixerOutput;
-    bool fHasSavedMixerOutput;
+    // For Disconnect policy restore: every mixer->device connection we broke
+    // (one per bus; Shared breaks the target bus, Exclusive breaks them all).
+    std::vector<media_output> fSavedMixerOutputs;
     
     // For SwitchToDevice policy restore
     media_input fOriginalSystemInput;

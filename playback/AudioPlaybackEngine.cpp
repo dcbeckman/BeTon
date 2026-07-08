@@ -301,6 +301,9 @@ void AudioPlaybackEngine::_CleanupMedia() {
     fNetworkStream = nullptr;
   }
 #if ENABLE_LOCAL_OUTPUT
+  // Safe here: the player is deleted and we waited for fInCallback to clear
+  // above, so the audio thread is no longer touching fResampler.
+  fResampler.Unset();
   fLocalOutputManager.Release();
 #endif
 }
@@ -460,6 +463,61 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
     fFadeOutFrames.store(std::max<int64>(0, fadeOut - frames),
                          std::memory_order_relaxed);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+// Extra source frames kept buffered inside the resampler so a full device
+// buffer can always be produced despite the converter's fractional-frame
+// latency (avoids a perpetual 1-frame shortfall when upsampling).
+static const int64 kResampleCushion = 128;
+
+int64 AudioPlaybackEngine::_FillResampled(void *buffer, int64 wantFrames,
+                                          bool &hitEof) {
+  hitEof = false;
+  const int srcFrameSize = fResampler.SrcFrameSize();
+  const int dstFrameSize = fResampler.DstFrameSize();
+  if (!fTrack || srcFrameSize <= 0 || dstFrameSize <= 0 || wantFrames <= 0)
+    return 0;
+
+  uint8 *out = (uint8 *)buffer;
+  int64 outFilled = 0;
+
+  // A resampler cannot emit output without being fed input (its filter needs
+  // upcoming samples), so we ALWAYS feed source here — never a zero-input
+  // drain. Feeding SourceFramesForOutput(need) plus a small cushion lets each
+  // convert emit the full `need`, buffering the cushion. SourceFramesForOutput
+  // subtracts what is already buffered, so the buffer stays ~cushion-sized and
+  // does not grow. The guard is a hard stop so the callback can never spin.
+  for (int guard = 0; outFilled < wantFrames && guard < 64; ++guard) {
+    int64 need = wantFrames - outFilled;
+    uint8 *dst = out + outFilled * dstFrameSize;
+
+    if (hitEof) {
+      // Flush the resampler's final tail (NULL input) after end-of-stream.
+      int64 got = fResampler.Convert(nullptr, 0, dst, need);
+      outFilled += got;
+      if (got == 0)
+        break;
+      continue;
+    }
+
+    int64 srcNeed = fResampler.SourceFramesForOutput(need) + kResampleCushion;
+    size_t needBytes = (size_t)srcNeed * srcFrameSize;
+    if (fResampleScratch.size() < needBytes)
+      fResampleScratch.resize(needBytes); // defensive; normally pre-sized
+
+    int64 srcFrames = srcNeed;
+    status_t ret = fTrack->ReadFrames(fResampleScratch.data(), &srcFrames);
+    if (ret != B_OK || srcFrames <= 0) {
+      hitEof = true;
+      continue; // flush on the next pass
+    }
+    outFilled += fResampler.Convert(fResampleScratch.data(), srcFrames, dst,
+                                    need);
+  }
+
+  return outFilled;
+}
+#endif
 
 status_t AudioPlaybackEngine::_StartMidiAt(int32 position) {
   if (!fMidiSynth)
@@ -731,23 +789,47 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
       // Leave the format wildcarded so the connection negotiates to the
       // device/bus's supported format instead of forcing the file's format.
       // A rate-fixed device (e.g. 48 kHz only) would otherwise fail to
-      // connect on a 44.1 kHz file. After connecting we re-init the decoder
-      // to the negotiated format so the media plugins resample (refinement A).
+      // connect on a 44.1 kHz file. We then resample the decoded stream to
+      // the negotiated format ourselves (see the resampler setup below).
       media_multi_audio_format format = media_multi_audio_format::wildcard;
 
       fPlayer = new BSoundPlayer(node, &format, "Orchester", &input, &_PlayBuffer, NULL, this);
 
       if (fPlayer && fPlayer->InitCheck() == B_OK) {
-        // media_format::u.raw_audio is a media_multi_audio_format (derived);
-        // wildcard it, then copy the negotiated raw_audio base fields into it.
-        media_format trackFormat;
-        trackFormat.type = B_MEDIA_RAW_AUDIO;
-        trackFormat.u.raw_audio = media_multi_audio_format::wildcard;
-        static_cast<media_raw_audio_format&>(trackFormat.u.raw_audio) = fPlayer->Format();
-        fTrack->DecodedFormat(&trackFormat);
-
-        fCurrentSampleRate.store(fPlayer->Format().frame_rate);
-        fCurrentChannels.store(fPlayer->Format().channel_count);
+        // The decoder emits the file's NATIVE format (raf, from DecodedFormat
+        // above) and does not resample the sample rate — only the system
+        // mixer does. A physical device node may run at a fixed, different
+        // rate (e.g. 48/96 kHz), so feeding native-rate frames straight to it
+        // played too fast/high-pitched ("chipmunks"). Convert native ->
+        // negotiated device format ourselves via libswresample.
+        media_raw_audio_format devFmt = fPlayer->Format();
+        status_t rs = fResampler.Init(raf, devFmt);
+        if (rs != B_OK) {
+          DEBUG_PRINT("Resampler init failed (%s), falling back to mixer\n",
+                      strerror(rs));
+          delete fPlayer;
+          fPlayer = nullptr;
+          fLocalOutputManager.Release();
+          fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+        } else {
+          // Pre-size the source scratch for one device buffer so the audio
+          // callback never allocates: worst-case source frames per callback.
+          if (fResampler.IsActive() && fResampler.SrcFrameSize() > 0) {
+            int64 dstFrames = fResampler.DstFrameSize() > 0
+                ? (int64)(devFmt.buffer_size / fResampler.DstFrameSize()) : 0;
+            int64 srcFrames = fResampler.SourceFramesForOutput(dstFrames)
+                + kResampleCushion + 64;
+            fResampleScratch.resize((size_t)srcFrames * fResampler.SrcFrameSize());
+          }
+          DEBUG_PRINT("Direct output: decoded %.0f Hz/%dch -> device %.0f Hz/%dch"
+                      " buffer_size=%ld (%s)\n", raf.frame_rate,
+                      (int)raf.channel_count, devFmt.frame_rate,
+                      (int)devFmt.channel_count, (long)devFmt.buffer_size,
+                      fResampler.IsActive() ? "resampling" : "passthrough");
+          // Display the track's native rate/channels, not the device's.
+          fCurrentSampleRate.store((int32)raf.frame_rate);
+          fCurrentChannels.store((int32)raf.channel_count);
+        }
       } else {
         // Direct connection failed (e.g. device rejected the format).
         // Release the device (restores the mixer) and fall back to default.
@@ -1471,6 +1553,40 @@ void AudioPlaybackEngine::_PlayBuffer(
       format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
   const int frameSize = bytesPerSample * format.channel_count;
   int64 frames = frameSize > 0 ? (int64)(size / frameSize) : 0;
+
+#if ENABLE_LOCAL_OUTPUT
+  // Direct output to a device whose rate/channels differ from the decoded
+  // file: pull native frames and convert them to the device format. When the
+  // formats match, fResampler is inactive and we fall through to the plain
+  // ReadFrames path below.
+  if (self->fResampler.IsActive()) {
+    bool hitEof = false;
+    int64 filled = self->_FillResampled(buffer, frames, hitEof);
+    size_t produced = (size_t)filled * frameSize;
+    if (filled > 0) {
+      self->fCurrentPos +=
+          (bigtime_t)((filled * 1000000LL) / (int)format.frame_rate);
+      self->_ApplyFade(buffer, produced, format);
+    }
+    if (produced < size)
+      memset((uint8 *)buffer + produced, 0, size - produced);
+    // Only end the track on a real end-of-stream from the decoder. A short
+    // fill without EOF is just converter latency and is padded with silence.
+    if (hitEof) {
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true) &&
+          self->fTarget.IsValid()) {
+        BMessage m(MSG_TRACK_ENDED);
+        self->fTarget.SendMessage(&m);
+      }
+    }
+    self->fInCallback.store(false, std::memory_order_relaxed);
+    return;
+  }
+#endif
+
   status_t ret = B_ERROR;
   if (self->fTrack && frames > 0)
     ret = self->fTrack->ReadFrames(buffer, &frames);

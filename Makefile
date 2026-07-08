@@ -11,6 +11,7 @@ SRCS = \
     app/MainWindow.cpp \
     app/UndoManager.cpp \
     audio/AudioOutputManager.cpp \
+    audio/AudioResampler.cpp \
     audio/OutputViewController.cpp \
     artwork/ArtworkController.cpp \
     dlna/DLNAMessageHandler.cpp \

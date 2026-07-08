@@ -5,6 +5,7 @@
 #include "Messages.h"
 #if ENABLE_LOCAL_OUTPUT
 #include "AudioOutputManager.h"
+#include "AudioResampler.h"
 #endif
 
 #include <Autolock.h>
@@ -121,6 +122,16 @@ private:
   void _BeginFadeOut();
   void _ApplyFade(void *buffer, size_t size,
                   const media_raw_audio_format &format);
+#if ENABLE_LOCAL_OUTPUT
+  /**
+   * @brief Fill @p buffer with resampled local-file audio (direct output).
+   *
+   * Reads native-format frames from fTrack and converts them to the device
+   * format via fResampler. Returns destination frames written (< wantFrames
+   * signals end of track).
+   */
+  int64 _FillResampled(void *buffer, int64 wantFrames, bool &hitEof);
+#endif
   status_t _StartMidiAt(int32 position);
   void _StopMidi(bool unload);
   void _SilenceMidi();
@@ -194,6 +205,12 @@ private:
   OutputBusInfo fLocalOutputBus;
   MixerConflictPolicy fLocalConflictPolicy = MixerConflictPolicy::Disconnect;
   BString fLocalFallbackDevice;
+  // Resamples native decoded frames to a direct device's negotiated format.
+  // Active only on the local-file direct path; passthrough/unset otherwise.
+  AudioResampler fResampler;
+  // Reusable source-frame scratch for _FillResampled, pre-sized in Play()
+  // so the audio callback does not allocate on the hot path.
+  std::vector<uint8> fResampleScratch;
 #endif
 
 #if ENABLE_DLNA_OUTPUT

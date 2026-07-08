@@ -1,4 +1,5 @@
 #include "AudioOutputManager.h"
+#include "Debug.h"
 #include <FindDirectory.h>
 #include <Path.h>
 #include <Directory.h>
@@ -43,7 +44,6 @@ static status_t GetNodeForID(media_node_id id, media_node* outNode) {
 AudioOutputManager::AudioOutputManager()
     : fAlteredSystem(false),
       fAlteredPolicy(MixerConflictPolicy::Disconnect),
-      fHasSavedMixerOutput(false),
       fHasOriginalSystemInput(false),
       fHasAcquiredNode(false) {
 }
@@ -164,13 +164,52 @@ status_t AudioOutputManager::Acquire(const OutputBusInfo& target,
 
     bool isTargetDefault = (hasDefault && target.deviceNode.node == defaultNode.node);
 
-    if (mode == OutputTarget::DirectExclusive && isTargetDefault) {
+    // A direct connection (Shared or Exclusive) must free the mixer from the
+    // port(s) it would collide on: Shared frees only the target bus, Exclusive
+    // frees every bus of the device (claims the whole device). A physical
+    // output node exposes one connection slot per bus, so leaving the mixer on
+    // our bus garbles playback (two producers on one slot).
+    bool wantEvict = (mode == OutputTarget::DirectShared ||
+                      mode == OutputTarget::DirectExclusive) && isTargetDefault;
+
+    // Determine which mixer->device connections conflict with this claim.
+    // (All inputs of a node share the node's control port, so a destination on
+    // the target device is identified by matching that port; the specific bus
+    // is the destination.id.)
+    std::vector<media_output> conflicts;
+    if (wantEvict) {
+        media_node mixer;
+        if (roster->GetAudioMixer(&mixer) == B_OK) {
+            NodeReleaser mixerReleaser(mixer);
+            media_output outputs[16];
+            int32 found = 0;
+            if (roster->GetConnectedOutputsFor(mixer, outputs, 16, &found) == B_OK) {
+                for (int32 i = 0; i < found; i++) {
+                    if (outputs[i].destination.port != target.deviceNode.port)
+                        continue;
+                    bool sameBus = (outputs[i].destination.id ==
+                                    target.input.destination.id);
+                    if (mode == OutputTarget::DirectExclusive || sameBus)
+                        conflicts.push_back(outputs[i]);
+                }
+            }
+        }
+    }
+
+    bool hasConflict = wantEvict && !conflicts.empty();
+    DEBUG_PRINT("Acquire: mode=%s conflicts=%d (evicting mixer from %s)\n",
+                mode == OutputTarget::DirectExclusive ? "Exclusive" : "Shared",
+                (int)conflicts.size(),
+                mode == OutputTarget::DirectExclusive ? "all buses" : "target bus");
+
+    if (hasConflict) {
         BString origInputName = defaultInputName;
         if (origInputName.IsEmpty() && defaultInputId != -1) {
             origInputName.SetToFormat("output %d", (int)defaultInputId);
         }
 
-        // 1. Write the crash-safe breadcrumb and fsync (refinement D)
+        // 1. Write the crash-safe breadcrumb and fsync (refinement D) BEFORE
+        //    mutating the system routing.
         st = _WriteBreadcrumb(target.deviceName, origInputName, policy);
         if (st != B_OK) {
             Release();
@@ -182,28 +221,11 @@ status_t AudioOutputManager::Acquire(const OutputBusInfo& target,
 
         // 2. Perform the policy mutation
         if (policy == MixerConflictPolicy::Disconnect) {
-            media_node mixer;
-            st = roster->GetAudioMixer(&mixer);
-            if (st == B_OK) {
-                NodeReleaser mixerReleaser(mixer);
-                media_output outputs[16];
-                int32 found = 0;
-                st = roster->GetConnectedOutputsFor(mixer, outputs, 16, &found);
-                if (st == B_OK) {
-                    for (int32 i = 0; i < found; i++) {
-                        // All inputs of a node share the node's control port, so
-                        // a destination on the target device is identified by
-                        // matching that port (media_destination has no node id).
-                        if (outputs[i].destination.port == target.deviceNode.port) {
-                            fSavedMixerOutput = outputs[i];
-                            fHasSavedMixerOutput = true;
-
-                            st = roster->Disconnect(outputs[i].node.node, outputs[i].source,
-                                                    target.deviceNode.node, outputs[i].destination);
-                            break;
-                        }
-                    }
-                }
+            for (size_t i = 0; i < conflicts.size(); i++) {
+                fSavedMixerOutputs.push_back(conflicts[i]);
+                roster->Disconnect(conflicts[i].node.node, conflicts[i].source,
+                                   target.deviceNode.node,
+                                   conflicts[i].destination);
             }
         } else if (policy == MixerConflictPolicy::SwitchToDevice) {
             bool fallbackFound = false;
@@ -258,11 +280,14 @@ void AudioOutputManager::Release() {
 
     if (fAlteredSystem) {
         if (fAlteredPolicy == MixerConflictPolicy::Disconnect) {
-            if (fHasSavedMixerOutput) {
+            // Reconnect every mixer->device connection we broke.
+            for (size_t i = 0; i < fSavedMixerOutputs.size(); i++) {
                 media_output outOutput;
                 media_input outInput;
-                media_format format = fSavedMixerOutput.format;
-                roster->Connect(fSavedMixerOutput.source, fSavedMixerOutput.destination, &format, &outOutput, &outInput);
+                media_format format = fSavedMixerOutputs[i].format;
+                roster->Connect(fSavedMixerOutputs[i].source,
+                                fSavedMixerOutputs[i].destination, &format,
+                                &outOutput, &outInput);
             }
         } else if (fAlteredPolicy == MixerConflictPolicy::SwitchToDevice) {
             if (fHasOriginalSystemInput) {
@@ -271,7 +296,7 @@ void AudioOutputManager::Release() {
         }
         _ClearBreadcrumb();
         fAlteredSystem = false;
-        fHasSavedMixerOutput = false;
+        fSavedMixerOutputs.clear();
         fHasOriginalSystemInput = false;
     }
 
