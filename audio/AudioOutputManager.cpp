@@ -1,5 +1,7 @@
 #include "AudioOutputManager.h"
 #include "Debug.h"
+#include <ParameterWeb.h>
+#include <string.h>
 #include <FindDirectory.h>
 #include <Path.h>
 #include <Directory.h>
@@ -136,6 +138,90 @@ status_t AudioOutputManager::CurrentSystemDefault(media_node& node, BString& dev
         }
     }
     return B_OK;
+}
+
+status_t AudioOutputManager::GetSystemMixerGainDB(float& outGainDB) {
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (!roster)
+        return B_ERROR;
+
+    media_node mixer;
+    status_t st = roster->GetAudioMixer(&mixer);
+    if (st != B_OK)
+        return st;
+    NodeReleaser mixerReleaser(mixer);
+
+    BParameterWeb* web = NULL;
+    st = roster->GetParameterWebFor(mixer, &web);
+    if (st != B_OK || web == NULL)
+        return st != B_OK ? st : B_ERROR;
+
+    status_t result = B_ENTRY_NOT_FOUND;
+    int32 count = web->CountParameters();
+    for (int32 i = 0; i < count; i++) {
+        BParameter* p = web->ParameterAt(i);
+        if (p == NULL || p->Type() != BParameter::B_CONTINUOUS_PARAMETER)
+            continue;
+        const char* kind = p->Kind();
+        if (kind == NULL || strcmp(kind, B_MASTER_GAIN) != 0)
+            continue;
+
+        float vals[8];
+        size_t size = sizeof(vals);
+        bigtime_t when = 0;
+        if (p->GetValue(vals, &size, &when) == B_OK && size >= sizeof(float)) {
+            int32 n = (int32)(size / sizeof(float));
+            float sum = 0.0f;
+            for (int32 c = 0; c < n && c < 8; c++)
+                sum += vals[c];
+            outGainDB = sum / (n < 8 ? n : 8);
+            result = B_OK;
+        }
+        break; // master gain is unique
+    }
+
+    delete web;
+    return result;
+}
+
+bool AudioOutputManager::GetSystemMixerAttenuate3dB() {
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (!roster)
+        return false;
+
+    media_node mixer;
+    if (roster->GetAudioMixer(&mixer) != B_OK)
+        return false;
+    NodeReleaser mixerReleaser(mixer);
+
+    BParameterWeb* web = NULL;
+    if (roster->GetParameterWebFor(mixer, &web) != B_OK || web == NULL)
+        return false;
+
+    bool result = false;
+    int32 count = web->CountParameters();
+    for (int32 i = 0; i < count; i++) {
+        BParameter* p = web->ParameterAt(i);
+        if (p == NULL || p->Type() != BParameter::B_DISCRETE_PARAMETER)
+            continue;
+        const char* name = p->Name();
+        if (name == NULL)
+            continue;
+        // Identify the "Attenuate mixer output by 3 dB" toggle by name.
+        BString n(name);
+        n.ToLower();
+        if (n.FindFirst("3 db") < 0 && n.FindFirst("3db") < 0)
+            continue;
+        int32 val = 0;
+        size_t size = sizeof(val);
+        bigtime_t when = 0;
+        if (p->GetValue(&val, &size, &when) == B_OK)
+            result = (val != 0);
+        break;
+    }
+
+    delete web;
+    return result;
 }
 
 status_t AudioOutputManager::Acquire(const OutputBusInfo& target,

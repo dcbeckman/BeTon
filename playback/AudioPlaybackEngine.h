@@ -131,6 +131,14 @@ private:
    * signals end of track).
    */
   int64 _FillResampled(void *buffer, int64 wantFrames, bool &hitEof);
+  // Capture the system mixer's master gain for direct-output loudness matching.
+  // Call when a direct connection is established (before the mixer is
+  // disconnected). Sets fMixerMasterDb + fDirectCompActive, then recomputes.
+  void _UpdateDirectGain();
+  // Recompute fDirectGain from fVolume + fMixerMasterDb, replicating the Haiku
+  // mixer's non-linear volume+master curve so direct matches mixer loudness.
+  // Call on any volume change and after _UpdateDirectGain.
+  void _RecomputeDirectGain();
 #endif
   status_t _StartMidiAt(int32 position);
   void _StopMidi(bool unload);
@@ -211,6 +219,16 @@ private:
   // Reusable source-frame scratch for _FillResampled, pre-sized in Play()
   // so the audio callback does not allocate on the hot path.
   std::vector<uint8> fResampleScratch;
+  // Direct-output loudness match. In direct mode Beton applies fDirectGain in
+  // software (in _ApplyFade). It replicates the Haiku mixer's TOTAL gain on
+  // Beton's stream — the mixer's non-linear volume curve plus the master gain,
+  // both of which a direct connection bypasses — so switching output modes
+  // does not change loudness. Read on the audio thread; recomputed on the
+  // control thread whenever fVolume or the captured master changes.
+  std::atomic<float> fDirectGain{1.0f};
+  std::atomic<float> fMixerMasterDb{0.0f};    // captured mixer master (displayed dB)
+  std::atomic<bool> fDirectCompActive{false}; // true once a direct connect succeeds
+  std::atomic<bool> fMixerAttenuate3dB{false}; // mixer's "-3 dB output" toggle state
 #endif
 
 #if ENABLE_DLNA_OUTPUT

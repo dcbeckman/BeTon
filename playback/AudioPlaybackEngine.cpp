@@ -17,6 +17,7 @@
 #include <Path.h>
 #include <Url.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdio.h>
 #include <vector>
@@ -319,6 +320,10 @@ void AudioPlaybackEngine::SetVolume(float vol) {
   if (vol > 1.0f)
     vol = 1.0f;
   fVolume = vol;
+#if ENABLE_LOCAL_OUTPUT
+  // Keep the direct-mode software gain in step with the volume slider.
+  _RecomputeDirectGain();
+#endif
 
 #if ENABLE_DLNA_OUTPUT
   if (fDlnaManager && fDlnaManager->IsRemoteOutput()) {
@@ -414,7 +419,9 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
       gain *= static_cast<float>(fadeOut - frame) / totalFrames;
 
     if (needSoftwareVolume) {
-      gain *= fVolume;
+      // fDirectGain already folds in the user's volume AND the mixer-curve
+      // loudness match (or just the volume when no compensation is active).
+      gain *= fDirectGain.load(std::memory_order_relaxed);
     }
 
     if (gain < 0.0f)
@@ -517,6 +524,71 @@ int64 AudioPlaybackEngine::_FillResampled(void *buffer, int64 wantFrames,
 
   return outFilled;
 }
+
+// Replicate the Haiku audio mixer's non-linear dB->gain curve
+// (src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp dB_to_Gain). The
+// mixer's gain sliders report a warped "dB" value, so a displayed -39.7 dB is
+// NOT 10^(-39.7/20) of linear gain. To match the mixer's actual loudness we
+// must run its displayed dB through the same curve.
+static float MixerDbToGain(float db) {
+  const float kDbMax = 18.0f;
+  const float kDbMin = -60.0f;
+  const float kExpPos = 1.4f;
+  const float kExpNeg = 1.8f;
+  if (db > 0.0f) {
+    db = db * (powf(fabsf(kDbMax), 1.0f / kExpPos) / fabsf(kDbMax));
+    db = powf(db, kExpPos);
+  } else {
+    db = -db;
+    db = db * (powf(fabsf(kDbMin), 1.0f / kExpNeg) / fabsf(kDbMin));
+    db = powf(db, kExpNeg);
+    db = -db;
+  }
+  return powf(10.0f, db / 20.0f);
+}
+
+void AudioPlaybackEngine::_RecomputeDirectGain() {
+  float v = fVolume.load(std::memory_order_relaxed);
+  if (!fDirectCompActive.load(std::memory_order_relaxed)) {
+    // No mixer compensation (fell back to mixer, or not yet connected):
+    // apply just the user's volume, as before.
+    fDirectGain.store(v, std::memory_order_relaxed);
+    return;
+  }
+  // Replicate the mixer's total gain on our stream: its non-linear volume
+  // curve applied to fVolume (BSoundPlayer::SetVolume sets the mixer input to
+  // 20*log10(fVolume) displayed dB) times its master gain, both via the mixer
+  // curve. This is the exact loudness the mixer path would produce.
+  float volDb = v > 0.0f ? 20.0f * log10f(v) : -144.0f;
+  float g = MixerDbToGain(volDb) * MixerDbToGain(fMixerMasterDb.load(std::memory_order_relaxed));
+  // The mixer applies a straight x0.708 (~ -3 dB) to its output when the
+  // "Attenuate mixer output by 3 dB" toggle is on; replicate it if set.
+  if (fMixerAttenuate3dB.load(std::memory_order_relaxed))
+    g *= 0.708f;
+  if (g > 1.0f)
+    g = 1.0f;
+  if (g < 0.0f)
+    g = 0.0f;
+  fDirectGain.store(g, std::memory_order_relaxed);
+}
+
+void AudioPlaybackEngine::_UpdateDirectGain() {
+  float dB = 0.0f;
+  if (fLocalOutputManager.GetSystemMixerGainDB(dB) == B_OK) {
+    fMixerMasterDb.store(dB, std::memory_order_relaxed);
+    fMixerAttenuate3dB.store(fLocalOutputManager.GetSystemMixerAttenuate3dB(),
+                             std::memory_order_relaxed);
+    fDirectCompActive.store(true, std::memory_order_relaxed);
+    _RecomputeDirectGain();
+    DEBUG_PRINT("Direct gain: mixer master %.2f dB (curve) atten3dB=%d x fVol "
+                "-> gain x%.4f\n", dB,
+                (int)fMixerAttenuate3dB.load(), fDirectGain.load());
+  } else {
+    fDirectCompActive.store(false, std::memory_order_relaxed);
+    _RecomputeDirectGain();
+    DEBUG_PRINT("Could not read mixer gain; direct gain = fVolume only\n");
+  }
+}
 #endif
 
 status_t AudioPlaybackEngine::_StartMidiAt(int32 position) {
@@ -600,6 +672,11 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+#if ENABLE_LOCAL_OUTPUT
+  // Default to no compensation; the direct-connect path enables it on success.
+  fDirectCompActive.store(false, std::memory_order_relaxed);
+  _RecomputeDirectGain();
+#endif
 
   Stop(true);
   snooze(10000);
@@ -782,6 +859,11 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
 
 #if ENABLE_LOCAL_OUTPUT
   if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    // Read the mixer's master gain and set the loudness compensation BEFORE
+    // Acquire() disconnects the mixer — a disconnected mixer reports a default
+    // gain, which would defeat the match.
+    _UpdateDirectGain();
+
     media_node node;
     media_input input;
     status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
@@ -834,6 +916,8 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
         // Direct connection failed (e.g. device rejected the format).
         // Release the device (restores the mixer) and fall back to default.
         DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        fDirectCompActive.store(false, std::memory_order_relaxed);
+        _RecomputeDirectGain();
         delete fPlayer;
         fPlayer = nullptr;
         fLocalOutputManager.Release();
@@ -846,6 +930,8 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
       }
     } else {
       DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      fDirectCompActive.store(false, std::memory_order_relaxed);
+      _RecomputeDirectGain();
       if (fTarget.IsValid()) {
         BMessage errMsg(MSG_STATUS_UPDATE);
         errMsg.AddString("text", "Device in use, falling back to system default");
@@ -909,6 +995,10 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+#if ENABLE_LOCAL_OUTPUT
+  fDirectCompActive.store(false, std::memory_order_relaxed);
+  _RecomputeDirectGain();
+#endif
   fCurrentUrl = url;
   fCurrentTitle = title ? title : "";
 
@@ -1041,6 +1131,9 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
 
 #if ENABLE_LOCAL_OUTPUT
   if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    // Read mixer gain before Acquire() disconnects the mixer (see Play()).
+    _UpdateDirectGain();
+
     media_node node;
     media_input input;
     status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
@@ -1062,6 +1155,8 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
       } else {
         // Direct connection failed; release the device and fall back.
         DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        fDirectCompActive.store(false, std::memory_order_relaxed);
+        _RecomputeDirectGain();
         delete fPlayer;
         fPlayer = nullptr;
         fLocalOutputManager.Release();
@@ -1074,6 +1169,8 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
       }
     } else {
       DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      fDirectCompActive.store(false, std::memory_order_relaxed);
+      _RecomputeDirectGain();
       if (fTarget.IsValid()) {
         BMessage errMsg(MSG_STATUS_UPDATE);
         errMsg.AddString("text", "Device in use, falling back to system default");

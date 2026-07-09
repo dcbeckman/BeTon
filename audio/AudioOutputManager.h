@@ -52,6 +52,16 @@ public:
     status_t Enumerate(std::vector<OutputBusInfo>& out);
     status_t CurrentSystemDefault(media_node& node, BString& deviceName);
 
+    // Read the system audio mixer's master output gain (dB). This is the gain
+    // a direct (Shared/Exclusive) connection bypasses; callers apply it in
+    // software to keep loudness consistent when switching output modes.
+    status_t GetSystemMixerGainDB(float& outGainDB);
+
+    // True if the mixer's "Attenuate mixer output by 3 dB" toggle is on. The
+    // mixer applies a straight x0.708 to its output when enabled (and it is on
+    // by default), which a direct connection also bypasses.
+    bool GetSystemMixerAttenuate3dB();
+
     status_t Acquire(const OutputBusInfo& target,
                      OutputTarget mode,
                      MixerConflictPolicy policy,
