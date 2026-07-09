@@ -87,6 +87,12 @@ private:
     media_node fAcquiredNode;
     bool fHasAcquiredNode;
 
+    // Start the physical output node so its DAC output thread is running.
+    // BSoundPlayer starts only its own producer, never the consumer device
+    // node we hand it, so a direct connection is silent until something starts
+    // the node. Idempotent — safe when the node is already running.
+    void _EnsureNodeRunning(const media_node& node);
+
     status_t _WriteBreadcrumb(const BString& originalDeviceName, const BString& originalInputName, MixerConflictPolicy policy);
     void _ClearBreadcrumb();
     BString _GetBreadcrumbPath();

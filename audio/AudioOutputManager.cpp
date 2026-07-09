@@ -1,6 +1,7 @@
 #include "AudioOutputManager.h"
 #include "Debug.h"
 #include <ParameterWeb.h>
+#include <TimeSource.h>
 #include <string.h>
 #include <FindDirectory.h>
 #include <Path.h>
@@ -354,9 +355,37 @@ status_t AudioOutputManager::Acquire(const OutputBusInfo& target,
         }
     }
 
+    // Ensure the physical output node is running before we connect a
+    // BSoundPlayer to it. On a fresh boot nothing has yet driven this device
+    // (only System Mixer mode starts it implicitly), so its DAC output thread
+    // is stopped and a direct connection would be silent until the user
+    // toggled to System Mixer and back. Start it here.
+    _EnsureNodeRunning(fAcquiredNode);
+
     outNode = fAcquiredNode;
     outInput = target.input;
     return B_OK;
+}
+
+void AudioOutputManager::_EnsureNodeRunning(const media_node& node) {
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (!roster)
+        return;
+
+    // A physical output (DAC) node only consumes buffers while its output
+    // thread runs, and that thread is spawned when the node is started
+    // (StartNode -> _HandleStart -> _StartOutputThreadIfNeeded). BSoundPlayer
+    // starts only its own producer node, so we must start the consumer node
+    // ourselves. This is idempotent: the node no-ops a start when already
+    // running, so it is safe in the Shared/non-conflict case where the mixer
+    // already has the device going.
+    bigtime_t performanceTime = 0;
+    BTimeSource* ts = roster->MakeTimeSourceFor(node);
+    if (ts != NULL) {
+        performanceTime = ts->Now();
+        ts->Release();
+    }
+    roster->StartNode(node, performanceTime);
 }
 
 void AudioOutputManager::Release() {
