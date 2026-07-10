@@ -5,6 +5,8 @@
 #include "PlaylistEditController.h"
 #include "Messages.h"
 #include "PlaylistSelectionController.h"
+#include "LibraryBrowserController.h"
+#include "MediaTableView.h"
 
 #include <Message.h>
 
@@ -63,6 +65,23 @@ bool LibraryMessageHandler::HandleMessage(BMessage *msg) {
 
   case MSG_MEDIA_ITEM_REMOVED: {
     fWindow->fLibraryController->HandleMediaItemRemoved(msg);
+    break;
+  }
+
+  case MSG_FOLDER_ROW_RESTORE: {
+    // Undo of a Folder-mode move/trash: reinsert the saved row. Only if we are
+    // still viewing the same folder, so we never inject a stale row into an
+    // unrelated view.
+    BString folder;
+    if (msg->FindString("folder", &folder) == B_OK && fWindow->fIsFolderMode &&
+        fWindow->fCurrentPlaylistName == folder && fWindow->fLibraryManager) {
+      MediaTableView *cv = fWindow->fLibraryManager->ContentView();
+      if (cv) {
+        int32 index = -1;
+        msg->FindInt32("index", &index);
+        cv->AddEntry(MediaTableView::UnarchiveItem(msg), index);
+      }
+    }
     break;
   }
 

@@ -1115,7 +1115,7 @@ MediaTableView::~MediaTableView() {}
  * @brief Adds a single media item to the list view.
  * @param mi The media item to add.
  */
-void MediaTableView::AddEntry(const MediaItem &mi) {
+void MediaTableView::AddEntry(const MediaItem &mi, int32 index) {
   MediaRow *row = new MediaRow(mi);
   bool m = mi.missing;
 
@@ -1163,7 +1163,80 @@ void MediaTableView::AddEntry(const MediaItem &mi) {
                                        m, src, pathPtr),
                 12);
 
-  AddRow(row);
+  if (index >= 0 && index <= CountRows())
+    AddRow(row, index);
+  else
+    AddRow(row);
+}
+
+void MediaTableView::ArchiveItem(const MediaItem &mi, BMessage *out) {
+  if (!out)
+    return;
+  out->AddString("path", mi.path);
+  out->AddString("item_base", mi.base);
+  out->AddString("coverUrl", mi.coverUrl);
+  out->AddString("title", mi.title);
+  out->AddString("artist", mi.artist);
+  out->AddString("album", mi.album);
+  out->AddString("albumArtist", mi.albumArtist);
+  out->AddString("composer", mi.composer);
+  out->AddString("genre", mi.genre);
+  out->AddString("comment", mi.comment);
+  out->AddString("mbTrackId", mi.mbTrackId);
+  out->AddString("mbAlbumId", mi.mbAlbumId);
+  out->AddString("mbArtistId", mi.mbArtistId);
+  out->AddInt32("year", mi.year);
+  out->AddInt32("track", mi.track);
+  out->AddInt32("trackTotal", mi.trackTotal);
+  out->AddInt32("disc", mi.disc);
+  out->AddInt32("discTotal", mi.discTotal);
+  out->AddInt32("duration", mi.duration);
+  out->AddInt32("bitrate", mi.bitrate);
+  out->AddInt32("sampleRate", mi.sampleRate);
+  out->AddInt32("channels", mi.channels);
+  out->AddInt32("rating", mi.rating);
+  out->AddInt64("size", mi.size);
+  out->AddInt64("mtime", mi.mtime);
+  out->AddInt64("inode", mi.inode);
+  out->AddBool("missing", mi.missing);
+}
+
+MediaItem MediaTableView::UnarchiveItem(const BMessage *in) {
+  MediaItem mi;
+  if (!in)
+    return mi;
+  BString s;
+  int32 i32;
+  int64 i64;
+  bool b;
+  if (in->FindString("path", &s) == B_OK) mi.path = s;
+  if (in->FindString("item_base", &s) == B_OK) mi.base = s;
+  if (in->FindString("coverUrl", &s) == B_OK) mi.coverUrl = s;
+  if (in->FindString("title", &s) == B_OK) mi.title = s;
+  if (in->FindString("artist", &s) == B_OK) mi.artist = s;
+  if (in->FindString("album", &s) == B_OK) mi.album = s;
+  if (in->FindString("albumArtist", &s) == B_OK) mi.albumArtist = s;
+  if (in->FindString("composer", &s) == B_OK) mi.composer = s;
+  if (in->FindString("genre", &s) == B_OK) mi.genre = s;
+  if (in->FindString("comment", &s) == B_OK) mi.comment = s;
+  if (in->FindString("mbTrackId", &s) == B_OK) mi.mbTrackId = s;
+  if (in->FindString("mbAlbumId", &s) == B_OK) mi.mbAlbumId = s;
+  if (in->FindString("mbArtistId", &s) == B_OK) mi.mbArtistId = s;
+  if (in->FindInt32("year", &i32) == B_OK) mi.year = i32;
+  if (in->FindInt32("track", &i32) == B_OK) mi.track = i32;
+  if (in->FindInt32("trackTotal", &i32) == B_OK) mi.trackTotal = i32;
+  if (in->FindInt32("disc", &i32) == B_OK) mi.disc = i32;
+  if (in->FindInt32("discTotal", &i32) == B_OK) mi.discTotal = i32;
+  if (in->FindInt32("duration", &i32) == B_OK) mi.duration = i32;
+  if (in->FindInt32("bitrate", &i32) == B_OK) mi.bitrate = i32;
+  if (in->FindInt32("sampleRate", &i32) == B_OK) mi.sampleRate = i32;
+  if (in->FindInt32("channels", &i32) == B_OK) mi.channels = i32;
+  if (in->FindInt32("rating", &i32) == B_OK) mi.rating = i32;
+  if (in->FindInt64("size", &i64) == B_OK) mi.size = i64;
+  if (in->FindInt64("mtime", &i64) == B_OK) mi.mtime = i64;
+  if (in->FindInt64("inode", &i64) == B_OK) mi.inode = i64;
+  if (in->FindBool("missing", &b) == B_OK) mi.missing = b;
+  return mi;
 }
 
 void MediaTableView::UpdateItem(const MediaItem &mi, const BString *matchPath) {

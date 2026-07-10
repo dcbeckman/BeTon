@@ -20,6 +20,8 @@
 #include <Path.h>
 #include <Entry.h>
 #include <Directory.h>
+#include <Node.h>
+#include <Volume.h>
 #include <algorithm>
 #include <stack>
 #include <random>
@@ -107,7 +109,12 @@ PlaylistEditController::PlaylistEditController(MainWindow* window)
 }
 
 PlaylistEditController::~PlaylistEditController() {
+    // fFilePanel is owned by MainWindow (it also deletes it in ~MainWindow).
+    // Null it after freeing so MainWindow's later delete is a safe no-op;
+    // otherwise it double-frees whenever a file panel was opened this session
+    // (e.g. after "Move File To..."), crashing on exit.
     delete fWindow->fFilePanel;
+    fWindow->fFilePanel = nullptr;
 }
 
 void PlaylistEditController::PromptNewPlaylist(BMessage *msg) {
@@ -823,8 +830,56 @@ void PlaylistEditController::DeleteSelectedPlaylistItems() {
   }
 }
 
+// Records undo/redo for a Folder-mode move/trash so the affected rows can be
+// restored/dropped without re-reading the whole folder from disk. Undo
+// reinserts each row from its saved column data (ascending original index so
+// positions are preserved); redo drops the rows again, prepended so it runs
+// before the redo file move while the rows still carry their original path.
+static void BuildFolderRowUndoRedo(const BString &folderName,
+                                   const std::vector<MediaItem> &items,
+                                   const std::vector<int32> &indices,
+                                   std::vector<BMessage> &undoMsgs,
+                                   std::vector<BMessage> &redoMsgs) {
+  std::vector<size_t> order(items.size());
+  for (size_t i = 0; i < order.size(); i++)
+    order[i] = i;
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return indices[a] < indices[b]; });
+  for (size_t k : order) {
+    BMessage restore(MSG_FOLDER_ROW_RESTORE);
+    MediaTableView::ArchiveItem(items[k], &restore);
+    restore.AddInt32("index", indices[k]);
+    restore.AddString("folder", folderName);
+    undoMsgs.push_back(restore);
+  }
+
+  std::vector<BMessage> dropMsgs;
+  for (const auto &mi : items) {
+    BMessage drop(MSG_MEDIA_ITEM_REMOVED);
+    drop.AddString("path", mi.path);
+    dropMsgs.push_back(drop);
+  }
+  redoMsgs.insert(redoMsgs.begin(), dropMsgs.begin(), dropMsgs.end());
+}
+
+void PlaylistEditController::_RemoveRowsFromView(MediaTableView *cv,
+                                                const std::vector<BRow *> &rows) {
+  if (!cv)
+    return;
+  for (BRow *r : rows) {
+    cv->RemoveRow(r);
+    delete r;
+  }
+}
+
 void PlaylistEditController::MoveSelectedItemsToTrash() {
-  bool inPlaylist = !fWindow->fCurrentPlaylistName.IsEmpty();
+  // A Folder view is backed by a real filesystem folder, not a playlist file:
+  // trashing acts directly on disk and the view refreshes from the folder, so
+  // it is never a "playlist update" and must not be blocked by the
+  // non-writable-playlist guard below (which otherwise silently no-ops because
+  // a folder has a name but isn't a writable playlist).
+  bool inPlaylist = !fWindow->fIsFolderMode &&
+      !fWindow->fCurrentPlaylistName.IsEmpty();
   bool updatesPlaylist = inPlaylist &&
       fWindow->fPlaylistLibrary->IsPlaylistWritable(fWindow->fCurrentPlaylistName);
   if (inPlaylist && !updatesPlaylist)
@@ -832,22 +887,22 @@ void PlaylistEditController::MoveSelectedItemsToTrash() {
 
   MediaTableView *cv = fWindow->fLibraryManager->ContentView();
   std::vector<BString> selectedPaths;
+  std::vector<BRow *> selectedRows;
+  std::vector<MediaItem> selectedItems;
+  std::vector<int32> selectedIndices;
   BRow *row = nullptr;
   while ((row = cv->CurrentSelection(row)) != nullptr) {
     const MediaItem *mi = cv->ItemAt(cv->IndexOf(row));
     if (mi) {
       selectedPaths.push_back(mi->path);
+      selectedRows.push_back(row);
+      selectedItems.push_back(*mi);
+      selectedIndices.push_back(cv->IndexOf(row));
     }
   }
 
   if (selectedPaths.empty())
     return;
-
-  BPath trashPath;
-  if (find_directory(B_TRASH_DIRECTORY, &trashPath) != B_OK) {
-    fWindow->UpdateStatus(B_TRANSLATE("Failed to find Trash directory"));
-    return;
-  }
 
   std::vector<BMessage> undoMsgs;
   std::vector<BMessage> redoMsgs;
@@ -862,6 +917,20 @@ void PlaylistEditController::MoveSelectedItemsToTrash() {
     BEntry entry(path.String(), true);
     if (!entry.Exists())
       continue;
+
+    // Trash is per-volume and BEntry::MoveTo cannot cross volumes, so resolve
+    // the Trash on the file's own volume. Using the boot volume's Trash (the
+    // no-volume default) silently fails for files on a separate data volume,
+    // which is where music usually lives.
+    BPath trashPath;
+    node_ref nref;
+    BVolume volume;
+    if (entry.GetNodeRef(&nref) != B_OK ||
+        volume.SetTo(nref.device) != B_OK ||
+        find_directory(B_TRASH_DIRECTORY, &trashPath, true, &volume) != B_OK) {
+      fWindow->UpdateStatus(B_TRANSLATE("Failed to find Trash directory"));
+      continue;
+    }
 
     char leafName[B_FILE_NAME_LENGTH];
     entry.GetName(leafName);
@@ -947,6 +1016,15 @@ void PlaylistEditController::MoveSelectedItemsToTrash() {
       rPlaylist.AddString("paths", p);
     }
     redoMsgs.push_back(rPlaylist);
+  }
+
+  // In Folder mode there is no playlist file to rewrite; drop the trashed rows
+  // from the view directly so they disappear without re-reading the folder, and
+  // record undo/redo so they can be restored/dropped from saved data.
+  if (fWindow->fIsFolderMode) {
+    _RemoveRowsFromView(cv, selectedRows);
+    BuildFolderRowUndoRedo(fWindow->fCurrentPlaylistName, selectedItems,
+                           selectedIndices, undoMsgs, redoMsgs);
   }
 
   // 5. Register with UndoManager
@@ -1046,7 +1124,12 @@ void PlaylistEditController::HandleMoveToFolderSelected(BMessage *msg) {
 }
 
 void PlaylistEditController::MoveSelectedItemsTo(const entry_ref *targetDirRef) {
-  bool inPlaylist = !fWindow->fCurrentPlaylistName.IsEmpty();
+  // A Folder view is backed by a real filesystem folder, not a playlist file:
+  // moving acts directly on disk and the view refreshes from the folder, so it
+  // is never a "playlist update" and must not be blocked by the
+  // non-writable-playlist guard below.
+  bool inPlaylist = !fWindow->fIsFolderMode &&
+      !fWindow->fCurrentPlaylistName.IsEmpty();
   bool updatesPlaylist = inPlaylist &&
       fWindow->fPlaylistLibrary->IsPlaylistWritable(fWindow->fCurrentPlaylistName);
   if (inPlaylist && !updatesPlaylist)
@@ -1054,11 +1137,17 @@ void PlaylistEditController::MoveSelectedItemsTo(const entry_ref *targetDirRef) 
 
   MediaTableView *cv = fWindow->fLibraryManager->ContentView();
   std::vector<BString> selectedPaths;
+  std::vector<BRow *> selectedRows;
+  std::vector<MediaItem> selectedItems;
+  std::vector<int32> selectedIndices;
   BRow *row = nullptr;
   while ((row = cv->CurrentSelection(row)) != nullptr) {
     const MediaItem *mi = cv->ItemAt(cv->IndexOf(row));
     if (mi) {
       selectedPaths.push_back(mi->path);
+      selectedRows.push_back(row);
+      selectedItems.push_back(*mi);
+      selectedIndices.push_back(cv->IndexOf(row));
     }
   }
 
@@ -1180,6 +1269,15 @@ void PlaylistEditController::MoveSelectedItemsTo(const entry_ref *targetDirRef) 
       rPlaylist.AddString("paths", p);
     }
     redoMsgs.push_back(rPlaylist);
+  }
+
+  // In Folder mode there is no playlist file to rewrite; drop the moved rows
+  // from the view directly so they disappear without re-reading the folder, and
+  // record undo/redo so they can be restored/dropped from saved data.
+  if (fWindow->fIsFolderMode) {
+    _RemoveRowsFromView(cv, selectedRows);
+    BuildFolderRowUndoRedo(fWindow->fCurrentPlaylistName, selectedItems,
+                           selectedIndices, undoMsgs, redoMsgs);
   }
 
   // 5. Register with UndoManager

@@ -109,6 +109,7 @@
 #define MSG_MOVE_TO_TRASH 'mvtr'            ///< Move selection to Trash and remove from playlist.
 #define MSG_MOVE_TO 'mvto'                  ///< Prompt directory to move selected files to.
 #define MSG_MOVE_TO_FOLDER_SELECTED 'mtfs'  ///< Folder picked for Move To.
+#define MSG_FOLDER_ROW_RESTORE 'frrs'       ///< Undo: reinsert a moved/trashed folder row from saved data.
 #define MSG_RESTORE_PLAYLIST_PATHS 'rplp'    ///< Revert/restore playlist tracks.
 #define MSG_CREATE_PLAYLIST_WITH_PATHS 'cplp' ///< Create playlist and populate paths.
 #define MSG_DELETE_PLAYLIST_BY_NAME 'dpln'    ///< Delete playlist by name.
