@@ -44,6 +44,11 @@ MediaLibraryCache::MediaLibraryCache(const BMessenger &target)
 }
 
 MediaLibraryCache::~MediaLibraryCache() {
+  // Drop any pending throttled save first; the dirty check below writes the
+  // final state synchronously, so a queued MSG_CACHE_FLUSH would be moot.
+  delete fSaveThrottle;
+  fSaveThrottle = nullptr;
+
   if (fCacheDirty) {
     DEBUG_PRINT("Saving dirty cache before shutdown...\n");
     SaveCache();
@@ -678,6 +683,16 @@ void MediaLibraryCache::MessageReceived(BMessage *msg) {
     break;
   }
 
+  case MSG_CACHE_FLUSH: {
+    delete fSaveThrottle;
+    fSaveThrottle = nullptr;
+    if (fCacheDirty) {
+      SaveCache();
+      fCacheDirty = false;
+    }
+    break;
+  }
+
   case B_NODE_MONITOR: {
     int32 opcode;
     if (msg->FindInt32("opcode", &opcode) == B_OK) {
@@ -927,6 +942,11 @@ void MediaLibraryCache::ScanPath(const BString &dirPath) {
   if (dir.InitCheck() != B_OK)
     return;
 
+  // The scanner only reports files it finds, so anything deleted while this
+  // folder was not being watched would survive as a stale row. Reconcile
+  // before scanning so the view drops it.
+  _ReconcileFolderDeletions(dirPath);
+
   BVolume vol(ref.device);
   if (vol.KnowsQuery() &&
       fQueriedVolumes.find(ref.device) == fQueriedVolumes.end()) {
@@ -1095,9 +1115,7 @@ void MediaLibraryCache::_HandleNodeMonitor(BMessage *msg, int32 opcode) {
               item.base = parentPath.Path();
             }
             fEntries[newPath] = item;
-            fCacheDirty = true;
-            SaveCache();
-            fCacheDirty = false;
+            _ScheduleSave();
 
             if (fTarget.IsValid()) {
               BMessage fileMoved(MSG_FILE_MOVED);
@@ -1175,9 +1193,7 @@ void MediaLibraryCache::_ScanAndAddFile(const BString &pathStr) {
   }
 
   AddOrUpdateEntry(item);
-  fCacheDirty = true;
-  SaveCache();
-  fCacheDirty = false;
+  _ScheduleSave();
 
   if (fTarget.IsValid()) {
     BMessage update(MSG_MEDIA_ITEM_FOUND);
@@ -1205,9 +1221,7 @@ void MediaLibraryCache::_RemoveFileFromCache(const BString &pathStr) {
   auto it = fEntries.find(pathStr);
   if (it != fEntries.end()) {
     fEntries.erase(it);
-    fCacheDirty = true;
-    SaveCache();
-    fCacheDirty = false;
+    _ScheduleSave();
 
     if (fTarget.IsValid()) {
       BMessage removed(MSG_MEDIA_ITEM_REMOVED);
@@ -1234,4 +1248,64 @@ bool MediaLibraryCache::_IsSupportedAudioFile(const BString &path) {
       return true;
   }
   return false;
+}
+
+/** @brief Delay before a throttled cache write-back runs. */
+static const bigtime_t kSaveThrottleDelay = 1500000; // 1.5 s
+
+void MediaLibraryCache::_ScheduleSave() {
+  fCacheDirty = true;
+
+  if (fSaveThrottle != nullptr)
+    return; // A write-back is already pending; this change rides along.
+
+  BMessage flush(MSG_CACHE_FLUSH);
+  fSaveThrottle =
+      new BMessageRunner(BMessenger(this), &flush, kSaveThrottleDelay, 1);
+  if (fSaveThrottle->InitCheck() != B_OK) {
+    // Could not arm the runner: fall back to writing straight through rather
+    // than risk losing the change entirely.
+    delete fSaveThrottle;
+    fSaveThrottle = nullptr;
+    SaveCache();
+    fCacheDirty = false;
+  }
+}
+
+void MediaLibraryCache::_ReconcileFolderDeletions(const BString &folderPath) {
+  BString prefix = folderPath;
+  if (!prefix.EndsWith("/"))
+    prefix << "/";
+
+  bool removedAny = false;
+
+  for (auto it = fEntries.begin(); it != fEntries.end();) {
+    const BString &path = it->first;
+    if (path != folderPath && !path.StartsWith(prefix)) {
+      ++it;
+      continue;
+    }
+
+    BEntry entry(path.String());
+    if (entry.Exists()) {
+      ++it;
+      continue;
+    }
+
+    BString gonePath = path; // Copy: `path` refers into the node we erase.
+    DEBUG_PRINT("Folder reconcile: dropping missing file %s\n",
+                gonePath.String());
+
+    it = fEntries.erase(it);
+    removedAny = true;
+
+    if (fTarget.IsValid()) {
+      BMessage gone(MSG_MEDIA_ITEM_REMOVED);
+      gone.AddString("path", gonePath);
+      fTarget.SendMessage(&gone);
+    }
+  }
+
+  if (removedAny)
+    _ScheduleSave();
 }

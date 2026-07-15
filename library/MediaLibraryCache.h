@@ -150,7 +150,29 @@ private:
   void _RemoveFileFromCache(const BString &pathStr);
   static bool _IsSupportedAudioFile(const BString &path);
 
+  /**
+   * @brief Marks the cache dirty and throttles the write-back to disk.
+   *
+   * Node-monitor events can arrive in bursts (e.g. dropping hundreds of files
+   * into a watched folder). Writing the whole cache per event is O(n) each
+   * time, so instead arm a one-shot runner and coalesce: at most one SaveCache()
+   * per kSaveThrottleDelay while events keep coming.
+   */
+  void _ScheduleSave();
+
+  /**
+   * @brief Drops cache entries under `folderPath` whose file no longer exists.
+   *
+   * The scanner only reports files it finds, so deletions that happened while
+   * the folder was not being watched would otherwise linger until a full
+   * rescan. Called on folder entry, before the catch-up scan.
+   * @param folderPath Folder root to reconcile.
+   */
+  void _ReconcileFolderDeletions(const BString &folderPath);
+
   std::vector<node_ref> fWatchedNodes;
+  /** @brief Armed one-shot save runner, or NULL when no save is pending. */
+  BMessageRunner *fSaveThrottle{nullptr};
 };
 
 #endif // BETON_MEDIA_LIBRARY_CACHE_H

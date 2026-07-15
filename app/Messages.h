@@ -25,6 +25,7 @@
 #define MSG_DIR_OK 'doky'             ///< Directory settings confirm.
 #define MSG_ATTR_POLL 'apol' ///< Periodic poll for BFS attribute changes.
 #define MSG_WATCH_FOLDER 'wtch'       ///< Watch directory node for live folder updates.
+#define MSG_CACHE_FLUSH 'cfls'        ///< Throttled cache write-back tick.
 ///@}
 
 /** @name Playback Control */
