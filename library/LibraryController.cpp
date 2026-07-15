@@ -307,16 +307,9 @@ void LibraryController::HandleMediaBatch(BMessage *msg) {
     return;
 
   for (int32 i = 0; i < count; i++) {
-    BString pathStr;
-    if (msg->FindString("path", i, &pathStr) != B_OK)
-      continue;
-
-    BPath normPath(pathStr.String());
     BString path;
-    if (normPath.InitCheck() == B_OK)
-      path = normPath.Path();
-    else
-      path = pathStr;
+    if (msg->FindString("path", i, &path) != B_OK)
+      continue;
 
     bool isNewItem = false;
     MediaItem *itemToUpdate = nullptr;
@@ -357,7 +350,8 @@ void LibraryController::HandleMediaBatch(BMessage *msg) {
           fWindow->fLibraryManager ? fWindow->fLibraryManager->ContentView() : nullptr;
       if (cv) {
         if (isNewItem) {
-          if (fWindow->fIsLibraryMode) {
+          if (fWindow->fIsLibraryMode ||
+              (fWindow->fIsFolderMode && fWindow->fLibraryManager->IsPathAllowed(path, false))) {
             cv->AddEntry(*itemToUpdate);
           }
         } else {
@@ -394,66 +388,26 @@ void LibraryController::RefreshPartialViews() {
  * @brief Applies single-item updates from scanner/metadata changes.
  */
 void LibraryController::HandleMediaItemFound(BMessage *msg) {
-  BString pathStr;
-  if (msg->FindString("path", &pathStr) != B_OK) {
+  BString path;
+  if (msg->FindString("path", &path) != B_OK) {
     DEBUG_PRINT(
         "MSG_MEDIA_ITEM_FOUND path not found in message!\n");
     return;
   }
 
-  BPath normPath(pathStr.String());
-  BString path;
-  if (normPath.InitCheck() == B_OK)
-    path = normPath.Path();
-  else
-    path = pathStr;
-
-  DEBUG_PRINT("Item update path: '%s' (Normalized from '%s')\n",
-              path.String(), pathStr.String());
+  DEBUG_PRINT("Item update path: '%s'\n", path.String());
 
   MediaItem *itemToUpdate = nullptr;
   auto mapIt = fWindow->fPathIndex.find(path);
   bool isLibraryItem = (mapIt != fWindow->fPathIndex.end());
   if (isLibraryItem) {
     itemToUpdate = &fWindow->fAllItems[mapIt->second];
-  } else if (!fWindow->fIsFolderMode) {
+  } else {
     MediaItem newItem;
     newItem.path = path;
     fWindow->fAllItems.push_back(newItem);
     fWindow->fPathIndex[path] = fWindow->fAllItems.size() - 1;
     itemToUpdate = &fWindow->fAllItems.back();
-  }
-
-  // Folder-mode item not in library: apply update in-place without touching
-  // fAllItems, so no stale-comparison triggers a needless full view rebuild.
-  if (!itemToUpdate && fWindow->fIsFolderMode) {
-    MediaItem folderItem;
-    folderItem.path = path;
-    BString tmp;
-    int32 val;
-    if (msg->FindString("title", &tmp) == B_OK) folderItem.title = tmp;
-    if (msg->FindString("artist", &tmp) == B_OK) folderItem.artist = tmp;
-    if (msg->FindString("album", &tmp) == B_OK) folderItem.album = tmp;
-    if (msg->FindString("albumArtist", &tmp) == B_OK) folderItem.albumArtist = tmp;
-    if (msg->FindString("composer", &tmp) == B_OK) folderItem.composer = tmp;
-    if (msg->FindString("genre", &tmp) == B_OK) folderItem.genre = tmp;
-    if (msg->FindString("comment", &tmp) == B_OK) folderItem.comment = tmp;
-    if (msg->FindInt32("year", &val) == B_OK) folderItem.year = val;
-    if (msg->FindInt32("track", &val) == B_OK) folderItem.track = val;
-    if (msg->FindInt32("trackTotal", &val) == B_OK) folderItem.trackTotal = val;
-    if (msg->FindInt32("disc", &val) == B_OK) folderItem.disc = val;
-    if (msg->FindInt32("discTotal", &val) == B_OK) folderItem.discTotal = val;
-    if (msg->FindInt32("rating", &val) == B_OK) folderItem.rating = val;
-    if (msg->FindInt32("duration", &val) == B_OK) folderItem.duration = val;
-    if (msg->FindInt32("bitrate", &val) == B_OK) folderItem.bitrate = val;
-    if (fWindow->fLibraryManager) {
-      fWindow->fLibraryManager->UpdateActiveItem(folderItem);
-      if (fWindow->fLibraryManager->ContentView())
-        fWindow->fLibraryManager->ContentView()->UpdateItem(folderItem);
-    }
-    if (fWindow->fMetadataPropertiesWindow)
-      fWindow->fMetadataPropertiesWindow->PostMessage(msg);
-    return;
   }
 
   if (!itemToUpdate) {
@@ -524,8 +478,16 @@ void LibraryController::HandleMediaItemFound(BMessage *msg) {
 
   if (fWindow->fLibraryManager) {
     fWindow->fLibraryManager->UpdateActiveItem(*itemToUpdate);
-    if (fWindow->fLibraryManager->ContentView())
-      fWindow->fLibraryManager->ContentView()->UpdateItem(*itemToUpdate);
+    if (fWindow->fLibraryManager->ContentView()) {
+      if (isLibraryItem) {
+        fWindow->fLibraryManager->ContentView()->UpdateItem(*itemToUpdate);
+      } else {
+        if (fWindow->fIsLibraryMode ||
+            (fWindow->fIsFolderMode && fWindow->fLibraryManager->IsPathAllowed(path, false))) {
+          fWindow->fLibraryManager->ContentView()->AddEntry(*itemToUpdate);
+        }
+      }
+    }
   }
 
   if (fWindow->fMetadataPropertiesWindow)

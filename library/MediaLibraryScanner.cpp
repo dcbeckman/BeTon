@@ -162,7 +162,7 @@ void MediaLibraryScanner::ProcessFile(BEntry &entry) {
          * previous scan. Reading it from BFS on every fast-skip was
          * causing thousands of synchronous I/O operations per scan.
          * External rating changes (e.g. via Tracker) will be detected
-         * by Node Monitoring (TODO) or on next full rescan.
+         * by Node Monitoring or on next full rescan.
          */
         return;
       }

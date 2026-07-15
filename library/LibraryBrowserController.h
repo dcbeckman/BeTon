@@ -115,6 +115,11 @@ public:
    * @param items Allowed media items.
    */
   void SetActiveItems(const std::vector<MediaItem> &items);
+  /**
+   * @brief Sets active folder path scope for folder-like filtering.
+   * @param folderPath Active folder path.
+   */
+  void SetActiveFolderPath(const BString &folderPath);
 
   /**
    * @brief Replaces a path in the active scope after a file was moved.
@@ -157,6 +162,7 @@ private:
 
   std::vector<BString> fActivePaths;
   std::vector<MediaItem> fActiveItems;
+  BString fActiveFolderPath;
 
   /// Cache last selection to avoid resetting downstream columns unnecessarily
   BString fLastSelectedGenre;

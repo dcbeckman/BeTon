@@ -56,6 +56,23 @@ public:
   void StartScan();
 
   /**
+   * @brief Scans a single directory path asynchronously.
+   * @param dirPath Directory path to scan.
+   */
+  void ScanPath(const BString &dirPath);
+
+  /**
+   * @brief Starts watching a folder and its subdirectories recursively for updates.
+   * @param folderPath Directory path to watch.
+   */
+  void StartWatchingFolder(const BString &folderPath);
+
+  /**
+   * @brief Stops watching all folders/files currently watched.
+   */
+  void StopWatchingFolder();
+
+  /**
    * @brief Handles cache/scanner/query messages on the looper thread.
    * @param msg Incoming message.
    */
@@ -126,6 +143,14 @@ private:
    * @return `true` if at least one attribute changed.
    */
   bool _RereadBfsAttributes(MediaItem &item);
+
+  void _WatchDirRecursive(BDirectory &dir);
+  void _HandleNodeMonitor(BMessage *msg, int32 opcode);
+  void _ScanAndAddFile(const BString &pathStr);
+  void _RemoveFileFromCache(const BString &pathStr);
+  static bool _IsSupportedAudioFile(const BString &path);
+
+  std::vector<node_ref> fWatchedNodes;
 };
 
 #endif // BETON_MEDIA_LIBRARY_CACHE_H

@@ -1,5 +1,7 @@
 #include "MediaLibraryCache.h"
 #include "Config.h"
+#include "MetadataTagIO.h"
+#include <NodeMonitor.h>
 #include "Debug.h"
 #include "MediaLibraryScanner.h"
 #include "Messages.h"
@@ -80,12 +82,46 @@ void MediaLibraryCache::LoadDirectories(std::vector<BString> &outDirs) {
           outDirs.push_back(src.path);
         }
       }
-      if (!outDirs.empty()) {
-        DEBUG_PRINT("Loaded %zu directories from settings\n",
-                    outDirs.size());
-        return;
+    }
+  }
+
+  // Load from settings (folder_source)
+  BPath mainSettingsPath = p;
+  mainSettingsPath.Append("BeTon/settings");
+  BFile mainFile(mainSettingsPath.Path(), B_READ_ONLY);
+  if (mainFile.InitCheck() == B_OK) {
+    BMessage mainArchive;
+    if (mainArchive.Unflatten(&mainFile) == B_OK) {
+      BMessage item;
+      for (int32 i = 0; mainArchive.FindMessage("folder_source", i, &item) == B_OK; ++i) {
+        BString path;
+        if (item.FindString("path", &path) == B_OK && !path.IsEmpty()) {
+          bool isNested = false;
+          for (const auto &d : outDirs) {
+            if (path == d) {
+              isNested = true;
+              break;
+            }
+            BString prefix = d;
+            if (!prefix.EndsWith("/"))
+              prefix << "/";
+            if (path.StartsWith(prefix)) {
+              isNested = true;
+              break;
+            }
+          }
+          if (!isNested) {
+            outDirs.push_back(path);
+          }
+        }
+        item.MakeEmpty();
       }
     }
+  }
+
+  if (!outDirs.empty()) {
+    DEBUG_PRINT("Loaded %zu directories from settings\n",
+                outDirs.size());
   }
 }
 
@@ -104,11 +140,23 @@ void MediaLibraryCache::StartScan() {
   LoadDirectories(dirs);
 
   // 1) Remove entries that belong to directories no longer monitored.
-  std::set<BString> validBases(dirs.begin(), dirs.end());
-
   for (auto it = fEntries.begin(); it != fEntries.end();) {
     const MediaItem &e = it->second;
-    if (validBases.find(e.base) == validBases.end()) {
+    bool isUnderMonitored = false;
+    for (const auto &dir : dirs) {
+      if (e.base == dir) {
+        isUnderMonitored = true;
+        break;
+      }
+      BString prefix = dir;
+      if (!prefix.EndsWith("/"))
+        prefix << "/";
+      if (e.base.StartsWith(prefix)) {
+        isUnderMonitored = true;
+        break;
+      }
+    }
+    if (!isUnderMonitored) {
       it = fEntries.erase(it);
       fCacheDirty = true;
     } else {
@@ -609,10 +657,34 @@ void MediaLibraryCache::MessageReceived(BMessage *msg) {
     }
     break;
   }
-  case MSG_RESCAN:
+  case MSG_RESCAN: {
     DEBUG_PRINT("received MSG_RESCAN, starting new scan\n");
-    StartScan();
+    BString scanPath;
+    if (msg->FindString("path", &scanPath) == B_OK && !scanPath.IsEmpty()) {
+      ScanPath(scanPath);
+    } else {
+      StartScan();
+    }
     break;
+  }
+
+  case MSG_WATCH_FOLDER: {
+    BString watchPath;
+    if (msg->FindString("path", &watchPath) == B_OK && !watchPath.IsEmpty()) {
+      StartWatchingFolder(watchPath);
+    } else {
+      StopWatchingFolder();
+    }
+    break;
+  }
+
+  case B_NODE_MONITOR: {
+    int32 opcode;
+    if (msg->FindInt32("opcode", &opcode) == B_OK) {
+      _HandleNodeMonitor(msg, opcode);
+    }
+    break;
+  }
 
   case MSG_SCAN_DONE: {
     DEBUG_PRINT("received MSG_SCAN_DONE (scanners left: %ld)\\n",
@@ -843,4 +915,323 @@ bool MediaLibraryCache::_RereadBfsAttributes(MediaItem &item) {
   readInt("Audio:Bitrate", item.bitrate);
 
   return changed;
+}
+
+void MediaLibraryCache::ScanPath(const BString &dirPath) {
+  entry_ref ref;
+  status_t s = get_ref_for_path(dirPath.String(), &ref);
+  if (s != B_OK)
+    return;
+
+  BDirectory dir(&ref);
+  if (dir.InitCheck() != B_OK)
+    return;
+
+  BVolume vol(ref.device);
+  if (vol.KnowsQuery() &&
+      fQueriedVolumes.find(ref.device) == fQueriedVolumes.end()) {
+    _InitRatingLiveQueries(ref.device);
+  }
+
+  // Launch scanner. It reports via MSG_MEDIA_ITEM_FOUND/MSG_SCAN_DONE.
+  auto *scanner = new MediaLibraryScanner(ref, BMessenger(this), fTarget);
+  scanner->SetCache(fEntries);
+  scanner->Run();
+
+  BMessenger msgr(scanner);
+  msgr.SendMessage(MSG_START_SCAN);
+  fActiveScanners++;
+}
+
+void MediaLibraryCache::StartWatchingFolder(const BString &folderPath) {
+  StopWatchingFolder();
+
+  BEntry entry(folderPath.String(), true);
+  if (entry.InitCheck() != B_OK || !entry.Exists() || !entry.IsDirectory())
+    return;
+
+  BDirectory dir(&entry);
+  _WatchDirRecursive(dir);
+}
+
+void MediaLibraryCache::StopWatchingFolder() {
+  for (const auto &nref : fWatchedNodes) {
+    watch_node(&nref, B_STOP_WATCHING, this);
+  }
+  fWatchedNodes.clear();
+}
+
+void MediaLibraryCache::_WatchDirRecursive(BDirectory &dir) {
+  node_ref nref;
+  if (dir.GetNodeRef(&nref) == B_OK) {
+    bool alreadyWatched = false;
+    for (const auto &w : fWatchedNodes) {
+      if (w.device == nref.device && w.node == nref.node) {
+        alreadyWatched = true;
+        break;
+      }
+    }
+    if (!alreadyWatched) {
+      if (watch_node(&nref, B_WATCH_DIRECTORY | B_WATCH_NAME, this) == B_OK) {
+        fWatchedNodes.push_back(nref);
+      }
+    }
+  }
+
+  dir.Rewind();
+  BEntry entry;
+  while (dir.GetNextEntry(&entry) == B_OK) {
+    if (entry.IsDirectory()) {
+      BDirectory subDir(&entry);
+      _WatchDirRecursive(subDir);
+    } else if (entry.IsFile()) {
+      BPath path;
+      if (entry.GetPath(&path) == B_OK && _IsSupportedAudioFile(path.Path())) {
+        node_ref fileRef;
+        if (entry.GetNodeRef(&fileRef) == B_OK) {
+          bool alreadyWatched = false;
+          for (const auto &w : fWatchedNodes) {
+            if (w.device == fileRef.device && w.node == fileRef.node) {
+              alreadyWatched = true;
+              break;
+            }
+          }
+          if (!alreadyWatched) {
+            if (watch_node(&fileRef, B_WATCH_STAT, this) == B_OK) {
+              fWatchedNodes.push_back(fileRef);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void MediaLibraryCache::_HandleNodeMonitor(BMessage *msg, int32 opcode) {
+  switch (opcode) {
+    case B_ENTRY_CREATED: {
+      dev_t device;
+      ino_t directory;
+      const char *name = nullptr;
+      if (msg->FindInt32("device", &device) == B_OK &&
+          msg->FindInt64("directory", &directory) == B_OK &&
+          msg->FindString("name", &name) == B_OK) {
+        entry_ref ref(device, directory, name);
+        BEntry entry(&ref, true);
+        if (entry.Exists()) {
+          if (entry.IsDirectory()) {
+            node_ref nref;
+            if (entry.GetNodeRef(&nref) == B_OK) {
+              if (watch_node(&nref, B_WATCH_DIRECTORY | B_WATCH_NAME, this) == B_OK) {
+                fWatchedNodes.push_back(nref);
+                BDirectory dir(&entry);
+                _WatchDirRecursive(dir);
+              }
+            }
+          } else if (entry.IsFile()) {
+            BPath path(&ref);
+            if (path.InitCheck() == B_OK && _IsSupportedAudioFile(path.Path())) {
+              node_ref fileRef;
+              if (entry.GetNodeRef(&fileRef) == B_OK) {
+                watch_node(&fileRef, B_WATCH_STAT, this);
+                fWatchedNodes.push_back(fileRef);
+              }
+              _ScanAndAddFile(path.Path());
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    case B_ENTRY_REMOVED: {
+      ino_t node;
+      if (msg->FindInt64("node", &node) == B_OK) {
+        for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
+          if (it->second.inode == (uint64)node) {
+            _RemoveFileFromCache(it->first);
+            break;
+          }
+        }
+      }
+      break;
+    }
+
+    case B_ENTRY_MOVED: {
+      dev_t device;
+      ino_t fromDir;
+      ino_t toDir;
+      const char *fromName = nullptr;
+      const char *toName = nullptr;
+      ino_t node;
+      if (msg->FindInt32("device", &device) == B_OK &&
+          msg->FindInt64("from_directory", &fromDir) == B_OK &&
+          msg->FindInt64("to_directory", &toDir) == B_OK &&
+          msg->FindString("from_name", &fromName) == B_OK &&
+          msg->FindString("to_name", &toName) == B_OK &&
+          msg->FindInt64("node", &node) == B_OK) {
+        
+        BString oldPath;
+        MediaItem item;
+        bool found = false;
+        for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
+          if (it->second.inode == (uint64)node) {
+            oldPath = it->first;
+            item = it->second;
+            found = true;
+            break;
+          }
+        }
+
+        if (found) {
+          entry_ref toRef(device, toDir, toName);
+          BPath path(&toRef);
+          if (path.InitCheck() == B_OK) {
+            BString newPath = path.Path();
+            fEntries.erase(oldPath);
+            item.path = newPath;
+            BPath parentPath;
+            if (path.GetParent(&parentPath) == B_OK) {
+              item.base = parentPath.Path();
+            }
+            fEntries[newPath] = item;
+            fCacheDirty = true;
+            SaveCache();
+            fCacheDirty = false;
+
+            if (fTarget.IsValid()) {
+              BMessage fileMoved(MSG_FILE_MOVED);
+              fileMoved.AddString("from", oldPath);
+              fileMoved.AddString("to", newPath);
+              fTarget.SendMessage(&fileMoved);
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    case B_STAT_CHANGED: {
+      ino_t node;
+      if (msg->FindInt64("node", &node) == B_OK) {
+        for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
+          if (it->second.inode == (uint64)node) {
+            _ScanAndAddFile(it->first);
+            break;
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+void MediaLibraryCache::_ScanAndAddFile(const BString &pathStr) {
+  struct stat st;
+  if (stat(pathStr.String(), &st) != 0)
+    return;
+
+  MediaItem item;
+  item.path = pathStr;
+  BPath path(pathStr.String());
+  BPath parentPath;
+  if (path.GetParent(&parentPath) == B_OK) {
+    item.base = parentPath.Path();
+  } else {
+    item.base = pathStr;
+  }
+  item.title = path.Leaf() ? BString(path.Leaf()) : pathStr;
+  item.size = st.st_size;
+  item.mtime = st.st_mtime;
+  item.inode = st.st_ino;
+
+  TagData td;
+  MetadataWriteTargets targets = MetadataTagIO::WriteTargetsForPath(pathStr);
+  bool readOk = (!targets.tags && targets.bfs)
+      ? MetadataTagIO::ReadBfsAttributes(path, td)
+      : MetadataTagIO::ReadTags(path, td);
+  if (readOk) {
+    if (!td.title.IsEmpty())
+      item.title = td.title;
+    item.artist = td.artist;
+    item.album = td.album;
+    item.albumArtist = td.albumArtist;
+    item.composer = td.composer;
+    item.genre = td.genre;
+    item.comment = td.comment;
+    item.mbTrackId = td.mbTrackID;
+    item.mbAlbumId = td.mbAlbumID;
+    item.mbArtistId = td.mbArtistID;
+    item.year = td.year;
+    item.track = td.track;
+    item.trackTotal = td.trackTotal;
+    item.disc = td.disc;
+    item.discTotal = td.discTotal;
+    item.duration = td.lengthSec;
+    item.bitrate = td.bitrate;
+    item.sampleRate = td.sampleRate;
+    item.channels = td.channels;
+    item.rating = td.rating;
+  }
+
+  AddOrUpdateEntry(item);
+  fCacheDirty = true;
+  SaveCache();
+  fCacheDirty = false;
+
+  if (fTarget.IsValid()) {
+    BMessage update(MSG_MEDIA_ITEM_FOUND);
+    update.AddString("path", item.path);
+    update.AddString("title", item.title);
+    update.AddString("artist", item.artist);
+    update.AddString("album", item.album);
+    update.AddString("genre", item.genre);
+    update.AddString("comment", item.comment);
+    update.AddString("albumArtist", item.albumArtist);
+    update.AddString("composer", item.composer);
+    update.AddInt32("year", item.year);
+    update.AddInt32("track", item.track);
+    update.AddInt32("trackTotal", item.trackTotal);
+    update.AddInt32("disc", item.disc);
+    update.AddInt32("discTotal", item.discTotal);
+    update.AddInt32("rating", item.rating);
+    update.AddInt32("duration", item.duration);
+    update.AddInt32("bitrate", item.bitrate);
+    fTarget.SendMessage(&update);
+  }
+}
+
+void MediaLibraryCache::_RemoveFileFromCache(const BString &pathStr) {
+  auto it = fEntries.find(pathStr);
+  if (it != fEntries.end()) {
+    fEntries.erase(it);
+    fCacheDirty = true;
+    SaveCache();
+    fCacheDirty = false;
+
+    if (fTarget.IsValid()) {
+      BMessage removed(MSG_MEDIA_ITEM_REMOVED);
+      removed.AddString("path", pathStr);
+      fTarget.SendMessage(&removed);
+    }
+  }
+}
+
+bool MediaLibraryCache::_IsSupportedAudioFile(const BString &path) {
+  BString lower(path);
+  lower.ToLower();
+
+  static const char *exts[] = {".mp3", ".wav", ".flac", ".ogg",
+                               ".opus", ".m4a", ".aac",  ".wma"
+#if ENABLE_MIDI_PLAYBACK
+                               ,
+                               ".mid", ".midi"
+#endif
+  };
+
+  for (auto ext : exts) {
+    if (lower.EndsWith(ext))
+      return true;
+  }
+  return false;
 }

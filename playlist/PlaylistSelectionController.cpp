@@ -188,6 +188,11 @@ void PlaylistSelectionController::ShowRadioPlaylistSource() {
   fWindow->fLibraryManager->ContentView()->SetRadioMode(true);
   fWindow->fLibraryManager->ContentView()->SetFolderMode(false);
   fWindow->fLibraryManager->SetActivePaths({});
+  if (fWindow->fMediaLibraryCache) {
+    BMessage watchMsg(MSG_WATCH_FOLDER);
+    watchMsg.AddString("path", "");
+    BMessenger(fWindow->fMediaLibraryCache).SendMessage(&watchMsg);
+  }
   if (fWindow->fRadioStationController)
     fWindow->fRadioStationController->ShowStations();
   bool radioIsPlaying =
@@ -209,6 +214,11 @@ void PlaylistSelectionController::ShowLibraryPlaylistSource() {
   fWindow->fLibraryManager->ContentView()->SetFolderMode(false);
   fWindow->fLibraryManager->SetRadioFilterMode(false);
   fWindow->fLibraryManager->SetActivePaths({});
+  if (fWindow->fMediaLibraryCache) {
+    BMessage watchMsg(MSG_WATCH_FOLDER);
+    watchMsg.AddString("path", "");
+    BMessenger(fWindow->fMediaLibraryCache).SendMessage(&watchMsg);
+  }
   fWindow->UpdateFilteredViews();
 }
 
@@ -220,6 +230,11 @@ void PlaylistSelectionController::ShowRegularPlaylistSource(const BString &name)
   fWindow->fLibraryManager->SetRadioFilterMode(false);
   std::vector<BString> paths = fWindow->fPlaylistLibrary->LoadPlaylist(name);
   fWindow->fLibraryManager->SetActivePaths(paths);
+  if (fWindow->fMediaLibraryCache) {
+    BMessage watchMsg(MSG_WATCH_FOLDER);
+    watchMsg.AddString("path", "");
+    BMessenger(fWindow->fMediaLibraryCache).SendMessage(&watchMsg);
+  }
   fWindow->UpdateFilteredViews();
 }
 
@@ -231,73 +246,23 @@ void PlaylistSelectionController::ShowFolderPlaylistSource(const BString &name) 
   fWindow->fLibraryManager->SetRadioFilterMode(false);
 
   BString folderPath = fWindow->fPlaylistLibrary->FolderPathForName(name);
-  std::vector<MediaItem> items;
-  std::vector<BString> paths;
 
-  BEntry entry(folderPath.String(), true);
-  entry_ref ref;
-  if (entry.InitCheck() == B_OK && entry.Exists() &&
-      entry.GetRef(&ref) == B_OK && fWindow->fPlaylistEditController) {
-    fWindow->fPlaylistEditController->ResolveRefRecursively(ref, paths);
+  if (fWindow->fLibraryManager) {
+    fWindow->fLibraryManager->SetActiveFolderPath(folderPath);
   }
 
-  items.reserve(paths.size());
-  for (const auto &path : paths) {
-    MediaItem item;
-    item.path = path;
+  if (fWindow->fMediaLibraryCache) {
+    // 1) Trigger asynchronous catch-up scan
+    BMessage scanMsg(MSG_RESCAN);
+    scanMsg.AddString("path", folderPath);
+    BMessenger(fWindow->fMediaLibraryCache).SendMessage(&scanMsg);
 
-    BPath bpath(path.String());
-    BPath parentPath;
-    if (bpath.GetParent(&parentPath) == B_OK)
-      item.base = parentPath.Path();
-    else
-      item.base = folderPath;
-    item.title = bpath.Leaf() ? bpath.Leaf() : path.String();
-
-    struct stat st;
-    if (stat(path.String(), &st) == 0) {
-      item.size = st.st_size;
-      item.mtime = st.st_mtime;
-      item.inode = st.st_ino;
-    } else {
-      item.missing = true;
-    }
-
-    TagData td;
-    MetadataWriteTargets targets = MetadataTagIO::WriteTargetsForPath(path);
-    bool readOk = (!targets.tags && targets.bfs)
-        ? MetadataTagIO::ReadBfsAttributes(bpath, td)
-        : MetadataTagIO::ReadTags(bpath, td);
-    if (readOk) {
-      if (!td.title.IsEmpty())
-        item.title = td.title;
-      item.artist = td.artist;
-      item.album = td.album;
-      item.albumArtist = td.albumArtist;
-      item.composer = td.composer;
-      item.genre = td.genre;
-      item.comment = td.comment;
-      item.mbTrackId = td.mbTrackID;
-      item.mbAlbumId = td.mbAlbumID;
-      item.mbArtistId = td.mbArtistID;
-      item.year = td.year;
-      item.track = td.track;
-      item.trackTotal = td.trackTotal;
-      item.disc = td.disc;
-      item.discTotal = td.discTotal;
-      item.duration = td.lengthSec;
-      item.bitrate = td.bitrate;
-      item.sampleRate = td.sampleRate;
-      item.channels = td.channels;
-      item.rating = td.rating;
-    }
-
-    items.push_back(item);
+    // 2) Trigger node monitoring for this folder
+    BMessage watchMsg(MSG_WATCH_FOLDER);
+    watchMsg.AddString("path", folderPath);
+    BMessenger(fWindow->fMediaLibraryCache).SendMessage(&watchMsg);
   }
-
-  fWindow->fLibraryManager->SetActiveItems(items);
   fWindow->UpdateFilteredViews();
-  fWindow->fLibraryManager->ContentView()->SetPlaylistMode(false);
 }
 
 void PlaylistSelectionController::ResetAndHideFilters() {
