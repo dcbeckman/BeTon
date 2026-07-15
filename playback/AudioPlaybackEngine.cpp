@@ -1469,6 +1469,15 @@ void AudioPlaybackEngine::SeekTo(bigtime_t pos) {
     return;
   }
 
+  // Serialize against teardown. _CleanupMedia() releases fTrack (destroying the
+  // decoder) and only then clears the pointer, all under fPlayLock. Without
+  // holding it here, a seek can pass the null-check below, get preempted while
+  // ReleaseTrack() destroys the decoder, then call SeekToTime() on freed memory
+  // — AVCodecDecoder::SeekedTo() re-frees its stale fChunkBuffer and the heap
+  // aborts with a double free. Seeking to the end of a track makes this likely,
+  // since hitting the end starts teardown just as the seek is handled.
+  BAutolock lock(fPlayLock);
+
   if (!fTrack || fIsStreaming.load(std::memory_order_relaxed) || fIsMidiPlaying)
     return;
 
