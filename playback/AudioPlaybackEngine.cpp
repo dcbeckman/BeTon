@@ -226,7 +226,12 @@ static bool ComputeMidiDuration(const entry_ref &ref, bigtime_t &duration,
 
 AudioPlaybackEngine::AudioPlaybackEngine() {}
 
-AudioPlaybackEngine::~AudioPlaybackEngine() { Stop(); }
+AudioPlaybackEngine::~AudioPlaybackEngine() {
+#if ENABLE_LOCAL_OUTPUT
+  _WaitForPrime();
+#endif
+  Stop();
+}
 
 /**
  * @brief Sets the messenger for notifying the UI about playback events.
@@ -1486,6 +1491,9 @@ void AudioPlaybackEngine::Shutdown() {
   BAutolock lock(fPlayLock);
   fShuttingDown = true;
   fAtEnd = true;
+#if ENABLE_LOCAL_OUTPUT
+  _WaitForPrime();
+#endif
   _StopTimeUpdates();
 
   if (fPlayer) {
@@ -1732,6 +1740,43 @@ void AudioPlaybackEngine::_PlayBuffer(
 }
 
 #if ENABLE_LOCAL_OUTPUT
+namespace {
+struct PrimeData {
+  AudioPlaybackEngine *self;
+  OutputBusInfo bus;
+};
+} // namespace
+
+int32 AudioPlaybackEngine::_PrimeThreadEntry(void *arg) {
+  PrimeData *d = static_cast<PrimeData *>(arg);
+  d->self->fLocalOutputManager.Prime(d->bus);
+  delete d;
+  return 0;
+}
+
+void AudioPlaybackEngine::_WaitForPrime() {
+  thread_id t = fPrimeThread.exchange(-1, std::memory_order_relaxed);
+  if (t >= 0) {
+    status_t ret;
+    wait_for_thread(t, &ret);
+  }
+}
+
+void AudioPlaybackEngine::_SpawnPrime() {
+  // One prime at a time; join any prior one so fLocalOutputBus (captured
+  // below) is stable for its lifetime and it never races teardown.
+  _WaitForPrime();
+  PrimeData *d = new PrimeData{this, fLocalOutputBus};
+  thread_id t =
+      spawn_thread(_PrimeThreadEntry, "beton_prime", B_NORMAL_PRIORITY, d);
+  if (t >= 0) {
+    fPrimeThread.store(t, std::memory_order_relaxed);
+    resume_thread(t);
+  } else {
+    delete d;
+  }
+}
+
 void AudioPlaybackEngine::SetOutputDevice(OutputTarget target,
                                          const OutputBusInfo& bus,
                                          MixerConflictPolicy policy,
@@ -1782,6 +1827,12 @@ void AudioPlaybackEngine::SetOutputDevice(OutputTarget target,
         Pause();
       }
     }
+  } else if (target != OutputTarget::SystemDefault) {
+    // Nothing playing (startup restore, or the user picked a device while
+    // stopped): warm the device in the background so the first Play() connects
+    // to a running node instead of paying the cold-start settle on the play
+    // path. Skipped when resuming above, since that Play() warms it anyway.
+    _SpawnPrime();
   }
 }
 #endif

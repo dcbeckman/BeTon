@@ -5,6 +5,7 @@
 #include <MediaNode.h>
 #include <MediaRoster.h>
 #include <String.h>
+#include <atomic>
 #include <vector>
 
 #if ENABLE_LOCAL_OUTPUT
@@ -72,6 +73,15 @@ public:
     void Release();
     bool RecoverFromBreadcrumb();
 
+    // Pre-warm a physical output device so its DAC output thread is already
+    // running before the first Play connects a BSoundPlayer to it. Starts the
+    // node (and settles a genuine cold start, as _EnsureNodeRunning does), then
+    // drops our roster reference — the node keeps running. Does NOT touch the
+    // mixer or system routing: any conflict eviction still waits until
+    // Acquire() at play time. Safe to call from a background thread; it shares
+    // only fRunningNodeId (atomic) with the play-path Acquire().
+    void Prime(const OutputBusInfo& target);
+
 private:
     bool fAlteredSystem;
     MixerConflictPolicy fAlteredPolicy;
@@ -86,6 +96,14 @@ private:
     
     media_node fAcquiredNode;
     bool fHasAcquiredNode;
+
+    // Id of the physical output node we have already cold-started (and left
+    // running) this session. Persists across Acquire/Release cycles because
+    // Release() deliberately leaves the node running. Used by
+    // _EnsureNodeRunning to settle only on a genuine cold start. -1 = none.
+    // Atomic: written by Prime() on a background thread, read/written by
+    // _EnsureNodeRunning on the play path.
+    std::atomic<media_node_id> fRunningNodeId;
 
     // Start the physical output node so its DAC output thread is running.
     // BSoundPlayer starts only its own producer, never the consumer device

@@ -1,5 +1,6 @@
 #include "AudioOutputManager.h"
 #include "Debug.h"
+#include <OS.h>
 #include <ParameterWeb.h>
 #include <TimeSource.h>
 #include <string.h>
@@ -48,7 +49,8 @@ AudioOutputManager::AudioOutputManager()
     : fAlteredSystem(false),
       fAlteredPolicy(MixerConflictPolicy::Disconnect),
       fHasOriginalSystemInput(false),
-      fHasAcquiredNode(false) {
+      fHasAcquiredNode(false),
+      fRunningNodeId(-1) {
 }
 
 AudioOutputManager::~AudioOutputManager() {
@@ -386,6 +388,42 @@ void AudioOutputManager::_EnsureNodeRunning(const media_node& node) {
         ts->Release();
     }
     roster->StartNode(node, performanceTime);
+
+    // Cold start: a just-spawned DAC output thread is not yet stably pulling
+    // buffers, so a BSoundPlayer that connects in the same instant hands its
+    // first buffers to a consumer that never consumes them — the stream sits
+    // silent with the position frozen (the classic "first track after launch
+    // does nothing, the second plays fine" symptom; by the second play the
+    // node has been running for a second and is warm). Give the freshly
+    // started node a moment to settle so the imminent connection lands on a
+    // running node, exactly as the working second-play case does.
+    //
+    // Gate this on a real cold start: Release() leaves the node running, so
+    // once we have started a given node this session it stays warm and later
+    // track changes skip the wait and stay snappy. A different node id (device
+    // switch, or a fresh launch where fRunningNodeId is -1) is a cold start.
+    if (node.node != fRunningNodeId.load(std::memory_order_relaxed)) {
+        snooze(250000); // 250 ms, one-time per device cold start
+        fRunningNodeId.store(node.node, std::memory_order_relaxed);
+    }
+}
+
+void AudioOutputManager::Prime(const OutputBusInfo& target) {
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (!roster)
+        return;
+
+    // Get (reference) the physical node, start it so its DAC output thread is
+    // spinning, then release our reference. StartNode's effect persists after
+    // the reference is dropped (Release() relies on the same fact), so the
+    // node stays warm for the eventual Play(), which then finds fRunningNodeId
+    // already set and connects with no settle. Deliberately does not evict the
+    // mixer or alter routing — this only makes an idle device ready.
+    media_node node;
+    if (GetNodeForID(target.deviceNode.node, &node) != B_OK)
+        return;
+    _EnsureNodeRunning(node);
+    roster->ReleaseNode(node);
 }
 
 void AudioOutputManager::Release() {

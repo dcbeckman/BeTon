@@ -139,6 +139,14 @@ private:
   // mixer's non-linear volume+master curve so direct matches mixer loudness.
   // Call on any volume change and after _UpdateDirectGain.
   void _RecomputeDirectGain();
+  // Warm the selected direct-output device in the background so the first
+  // Play() connects to an already-running node (no cold-start settle on the
+  // play path). Spawned from SetOutputDevice when nothing is playing.
+  void _SpawnPrime();
+  // Join any outstanding prime thread. Called before spawning a new one and
+  // before teardown so the thread never outlives the engine.
+  void _WaitForPrime();
+  static int32 _PrimeThreadEntry(void *arg);
 #endif
   status_t _StartMidiAt(int32 position);
   void _StopMidi(bool unload);
@@ -229,6 +237,8 @@ private:
   std::atomic<float> fMixerMasterDb{0.0f};    // captured mixer master (displayed dB)
   std::atomic<bool> fDirectCompActive{false}; // true once a direct connect succeeds
   std::atomic<bool> fMixerAttenuate3dB{false}; // mixer's "-3 dB output" toggle state
+  // Background device-warm thread (see _SpawnPrime). -1 when none outstanding.
+  std::atomic<thread_id> fPrimeThread{-1};
 #endif
 
 #if ENABLE_DLNA_OUTPUT
