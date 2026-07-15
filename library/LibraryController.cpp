@@ -496,8 +496,18 @@ void LibraryController::HandleMediaItemFound(BMessage *msg) {
   if (needsFullRefresh) {
     DEBUG_PRINT("Scheduling debounced view refresh for %s...\n",
                 itemToUpdate->title.String());
+
+    // Keep Folder rows pinned. A full refresh rebuilds the content list and
+    // re-applies the sort column, so editing the very field the view is sorted
+    // by (Fast Edit on Artist while sorted by Artist) yanks the row to a new
+    // position under the cursor. The row was already updated in place above, so
+    // only the genre/artist/album filter lists still need rebuilding — and the
+    // partial refresh does exactly that, leaving the content list (and with it
+    // the row order and scroll position) untouched. Playlist mode has its own
+    // lock via the position column; Library mode keeps re-sorting as before.
+    BMessage refresh(fWindow->fIsFolderMode ? MSG_VIEWS_REFRESH_PARTIAL
+                                            : MSG_VIEWS_REFRESH);
     delete fWindow->fViewsRefreshRunner;
-    BMessage refresh(MSG_VIEWS_REFRESH);
     fWindow->fViewsRefreshRunner =
         new BMessageRunner(BMessenger(fWindow), &refresh, 200000, 1);
   }
