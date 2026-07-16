@@ -27,6 +27,7 @@ public:
 
     void RefreshDevices();
     void ToggleLocalOutputButton();
+    void ApplyButtonVisibility();
     
     AudioOutputManager& OutputManager() { return fOutputManager; }
 

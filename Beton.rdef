@@ -140,7 +140,8 @@ resource(1004) #'VICN' array {
   $"1001178422040A050109100117820004"
 };
 
-// DLNA Renderer
+// Audio output device (speaker) - used for the output device selection button,
+// both the local multi_audio one and the DLNA renderer one.
 resource(1005) #'VICN' array {
   $"6E6369660F04017A050102000202369178B7B26B3A0D9D38DA474B4E0D3DE725"
   $"00000000FFFF01000000020016023A86EB380B183BE90CBE6B0249FBA84B95E3"

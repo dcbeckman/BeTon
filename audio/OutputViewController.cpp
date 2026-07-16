@@ -2,6 +2,7 @@
 #include "MainWindow.h"
 #include "Messages.h"
 #include "AudioPlaybackEngine.h"
+#include <Button.h>
 #include <Menu.h>
 #include <MenuItem.h>
 #include <PopUpMenu.h>
@@ -264,30 +265,51 @@ void OutputViewController::RefreshDevices() {
     RebuildOutputMenu();
 }
 
+/**
+ * @brief Brings the toolbar button in line with fShowLocalOutputBtn.
+ *
+ * BView::Hide() and Show() nest: each Hide() raises a counter that a Show()
+ * lowers again, and only a count of zero is visible. Calling either one
+ * unconditionally lets the counter drift away from the setting - one Show()
+ * too many drives it negative, and from then on a Hide() only brings it back
+ * to zero and the button never disappears. So move the button only when its
+ * own state disagrees with the setting, which also makes this safe to call
+ * whenever the setting is (re)loaded. IsHidden(button) asks for the button's
+ * own state rather than the whole parent chain's.
+ */
+void OutputViewController::ApplyButtonVisibility() {
+    if (!fWindow || !fWindow->fBtnLocalOutput)
+        return;
+
+    BButton* btn = fWindow->fBtnLocalOutput;
+    const bool wantVisible = fWindow->fShowLocalOutputBtn;
+    if (wantVisible == !btn->IsHidden(btn))
+        return;
+
+    if (wantVisible)
+        btn->Show();
+    else
+        btn->Hide();
+
+    if (btn->Parent()) {
+        btn->Parent()->InvalidateLayout(true);
+        btn->Parent()->Relayout();
+    }
+    fWindow->InvalidateLayout(true);
+    fWindow->Layout(true);
+}
+
 void OutputViewController::ToggleLocalOutputButton() {
     if (!fWindow)
         return;
-        
+
     fWindow->fShowLocalOutputBtn = !fWindow->fShowLocalOutputBtn;
-    
-    if (fWindow->fBtnLocalOutput) {
-        if (fWindow->fShowLocalOutputBtn) {
-            fWindow->fBtnLocalOutput->Show();
-        } else {
-            fWindow->fBtnLocalOutput->Hide();
-        }
-        if (fWindow->fBtnLocalOutput->Parent()) {
-            fWindow->fBtnLocalOutput->Parent()->InvalidateLayout(true);
-            fWindow->fBtnLocalOutput->Parent()->Relayout();
-        }
-        fWindow->InvalidateLayout(true);
-        fWindow->Layout(true);
-    }
-    
+    ApplyButtonVisibility();
+
     // Trigger settings save
     BMessage saveMsg(MSG_LOCAL_OUTPUT_REFRESH + 101);
     fWindow->PostMessage(&saveMsg);
-    
+
     RebuildOutputMenu();
 }
 

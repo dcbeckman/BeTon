@@ -95,6 +95,7 @@ static constexpr int32 ICON_REPEAT_GREEN = 2011;
 static constexpr int32 ICON_REPEAT_ORANGE = 2012;
 static constexpr int32 ICON_MUTE_ON = 2013;
 static constexpr int32 ICON_MUTE_OFF = 2014;
+static constexpr int32 ICON_OUTPUT_DEVICE = 1005;
 ///@}
 
 bool MainWindow::_HandleViewMessage(BMessage *msg) {
@@ -496,8 +497,12 @@ MainWindow::MainWindow()
   fLocalServer.Start();
 #endif
 #if ENABLE_LOCAL_OUTPUT
-  if (fLocalOutputController)
+  if (fLocalOutputController) {
+    // _BuildUI() ran before LoadSettings(), so the button was laid out from
+    // the default rather than the saved setting; apply it now that it's known.
+    fLocalOutputController->ApplyButtonVisibility();
     fLocalOutputController->RebuildOutputMenu();
+  }
 
   BString breadcrumbPath;
   BPath bPath;
@@ -795,7 +800,7 @@ void MainWindow::_BuildUI() {
 
   fBtnMute = new IconButtonView("mute_icon", fIconMuteOn, new BMessage(MSG_MUTE_TOGGLE));
 #if ENABLE_DLNA_OUTPUT
-  fIconRenderer = LoadIconFromResource(1005, iconSize);
+  fIconRenderer = LoadIconFromResource(ICON_OUTPUT_DEVICE, iconSize);
 #endif
 
   if (fIconPrev)
@@ -861,12 +866,12 @@ void MainWindow::_BuildUI() {
   fLocalOutputMenu->SetTargetForItems(this);
 
   fBtnLocalOutput = new BButton("", new BMessage(MSG_SHOW_LOCAL_OUTPUT_MENU));
-  fIconLocalOutput = LoadIconFromResource(1006, iconSize);
+  fIconLocalOutput = LoadIconFromResource(ICON_OUTPUT_DEVICE, iconSize);
   if (fIconLocalOutput)
     fBtnLocalOutput->SetIcon(fIconLocalOutput, 0);
   fBtnLocalOutput->SetExplicitSize(buttonSize);
-  if (!fShowLocalOutputBtn)
-    fBtnLocalOutput->Hide();
+  // Visibility is applied from the saved setting after LoadSettings(), which
+  // runs later than this; see OutputViewController::ApplyButtonVisibility().
 #endif
 
   BScrollView *playlistScroll = new BScrollView(
