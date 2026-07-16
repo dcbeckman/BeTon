@@ -20,6 +20,7 @@
 #include <taglib/fileref.h>
 #include <taglib/flacfile.h>
 #include <taglib/flacpicture.h>
+#include <taglib/id3v1tag.h>
 #include <taglib/id3v2tag.h>
 #include <taglib/mp4coverart.h>
 #include <taglib/mp4file.h>
@@ -233,7 +234,8 @@ static uint32 _byteToRating(uint8_t val) {
  * @param out Output structure for metadata.
  * @return True if successful, false otherwise.
  */
-bool MetadataTagIO::ReadTags(const BPath &path, TagData &out) {
+bool MetadataTagIO::ReadTags(const BPath &path, TagData &out,
+                             bool bfsFallback) {
   if (path.InitCheck() != B_OK)
     return false;
 
@@ -413,7 +415,7 @@ bool MetadataTagIO::ReadTags(const BPath &path, TagData &out) {
   }
 
   TagData bfsData;
-  if (ReadBfsAttributes(path, bfsData)) {
+  if (bfsFallback && ReadBfsAttributes(path, bfsData)) {
     if (out.title.IsEmpty())
       out.title = bfsData.title;
     if (out.artist.IsEmpty())
@@ -475,6 +477,12 @@ bool MetadataTagIO::WriteTagsToFile(const BPath &path, const TagData &td,
 
     TagLib::ID3v2::Tag *id3 = f.ID3v2Tag(true);
     set_basic_tags(id3 ? static_cast<TagLib::Tag *>(id3) : f.tag(), td);
+
+    // Keep an existing ID3v1 tag in step. Reads go through TagLib's merged
+    // tag, which falls back to ID3v1 wherever ID3v2 is empty, so a field left
+    // stale here comes back as the old value after it is cleared in ID3v2.
+    if (TagLib::ID3v1::Tag *id3v1 = f.ID3v1Tag(false))
+      set_basic_tags(id3v1, td);
 
     if (id3) {
       {

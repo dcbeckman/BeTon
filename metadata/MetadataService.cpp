@@ -172,7 +172,7 @@ void MetadataService::SaveTags(const BMessage *msg) {
     if (ok) {
       if (targets.tags && targets.bfs && MetadataTagIO::IsBeFsVolume(path)) {
         TagData tdSaved;
-        MetadataTagIO::ReadTags(path, tdSaved);
+        MetadataTagIO::ReadTags(path, tdSaved, false);
         if (hasRating)
           tdSaved.rating = td.rating;
         MetadataTagIO::WriteBfsAttributes(path, tdSaved, nullptr, 512 * 1024);

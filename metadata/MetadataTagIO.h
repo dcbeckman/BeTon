@@ -152,9 +152,12 @@ namespace MetadataTagIO {
  * @brief Reads metadata from the specified file.
  * @param path The path to the audio file.
  * @param out Output struct to populate with metadata.
+ * @param bfsFallback If true, empty tag fields fall back to the file's BFS
+ *        attributes. Pass false when the result is written back to disk, or
+ *        the fallback resurrects values the caller meant to clear.
  * @return True on success, false otherwise.
  */
-bool ReadTags(const BPath &path, TagData &out);
+bool ReadTags(const BPath &path, TagData &out, bool bfsFallback = true);
 
 /**
  * @brief Reads metadata from Haiku BFS attributes.
