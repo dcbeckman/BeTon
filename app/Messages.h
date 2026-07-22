@@ -151,6 +151,8 @@
 #define MSG_COVER_CLEAR_ALBUM 'cvca'       ///< Clear cover for album.
 #define MSG_COVER_DROPPED_APPLY_ALL 'cvda' ///< dropped cover -> all files.
 #define MSG_COVER_BITMAP_READY 'cvbr'      ///< Cover bitmap loaded & ready.
+#define MSG_SHOW_COVER_CONTEXT_MENU 'sccm' ///< Show cover context menu on main screen.
+#define MSG_MAIN_COVER_LOAD_REF 'mclr'     ///< Main window cover file chosen from panel.
 ///@}
 
 /** @name Matching Window */

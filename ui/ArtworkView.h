@@ -26,6 +26,7 @@ public:
   void SetBitmap(BBitmap *bmp);
 
   void Draw(BRect update) override;
+  void MouseDown(BPoint where) override;
   void MessageReceived(BMessage *msg) override;
   void GetPreferredSize(float *w, float *h) override;
   void FrameResized(float width, float height) override;

@@ -1,7 +1,9 @@
 #ifndef ARTWORK_CONTROLLER_H
 #define ARTWORK_CONTROLLER_H
 
+#include <Point.h>
 #include <String.h>
+#include <vector>
 
 class BMessage;
 class MainWindow;
@@ -74,7 +76,40 @@ public:
    */
   void RequestEmbeddedCover(BMessage *msg);
 
+  ~ArtworkController();
+
+  /**
+   * @brief Shows cover pop-up menu for main window album art right-click.
+   * @param screenWhere Screen position for pop-up menu.
+   */
+  void ShowCoverContextMenu(BPoint screenWhere);
+
+  /**
+   * @brief Opens file panel to pick cover art image.
+   */
+  void OpenCoverFilePanel();
+
+  /**
+   * @brief Handles chosen cover image file from open file panel.
+   */
+  void HandleCoverChosen(const struct entry_ref &ref);
+
+  /**
+   * @brief Retrieves target file path list for main window cover operations.
+   */
+  std::vector<BString> GetMainCoverTargetPaths() const;
+
+  /**
+   * @brief Main screen cover context menu command handlers.
+   */
+  void HandleMainCoverClear();
+  void HandleMainCoverApplyAlbum();
+  void HandleMainCoverClearAlbum();
+
 private:
+  bool CanModifyFiles(const std::vector<BString> &paths) const;
+  bool HasCover(const std::vector<BString> &paths) const;
+
   /**
    * @brief Downloads remote artwork and posts the decoded bitmap back to UI.
    * @param path Media path associated with the cover request.
@@ -84,6 +119,7 @@ private:
 
   /** Window context used to access controllers, services, and UI targets. */
   MainWindow *fWindow;
+  class BFilePanel *fOpenPanel{nullptr};
 };
 
 #endif // ARTWORK_CONTROLLER_H
