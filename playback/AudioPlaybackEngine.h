@@ -35,6 +35,71 @@
 class DLNAService;
 class LocalFileHttpServer;
 
+struct AudioRingBuffer {
+  std::vector<uint8> buffer;
+  size_t capacity = 0;
+  std::atomic<size_t> writeHead{0};
+  std::atomic<size_t> readHead{0};
+
+  void Init(size_t sizeBytes) {
+    buffer.resize(sizeBytes);
+    capacity = sizeBytes;
+    writeHead.store(0, std::memory_order_relaxed);
+    readHead.store(0, std::memory_order_relaxed);
+  }
+
+  size_t AvailableRead() const {
+    size_t w = writeHead.load(std::memory_order_acquire);
+    size_t r = readHead.load(std::memory_order_relaxed);
+    return (w >= r) ? (w - r) : (capacity - r + w);
+  }
+
+  size_t AvailableWrite() const {
+    size_t r = readHead.load(std::memory_order_relaxed);
+    size_t w = writeHead.load(std::memory_order_relaxed);
+    return (r > w) ? (r - w - 1) : (capacity - w + r - 1);
+  }
+
+  size_t Write(const uint8 *src, size_t count) {
+    size_t avail = AvailableWrite();
+    if (count > avail)
+      count = avail;
+    if (count == 0)
+      return 0;
+
+    size_t w = writeHead.load(std::memory_order_relaxed);
+    size_t firstPart = std::min(count, capacity - w);
+    memcpy(&buffer[w], src, firstPart);
+    if (count > firstPart) {
+      memcpy(&buffer[0], src + firstPart, count - firstPart);
+    }
+    writeHead.store((w + count) % capacity, std::memory_order_release);
+    return count;
+  }
+
+  size_t Read(uint8 *dst, size_t count) {
+    size_t avail = AvailableRead();
+    if (count > avail)
+      count = avail;
+    if (count == 0)
+      return 0;
+
+    size_t r = readHead.load(std::memory_order_relaxed);
+    size_t firstPart = std::min(count, capacity - r);
+    memcpy(dst, &buffer[r], firstPart);
+    if (count > firstPart) {
+      memcpy(dst + firstPart, &buffer[0], count - firstPart);
+    }
+    readHead.store((r + count) % capacity, std::memory_order_release);
+    return count;
+  }
+
+  void Reset() {
+    writeHead.store(0, std::memory_order_relaxed);
+    readHead.store(0, std::memory_order_relaxed);
+  }
+};
+
 class AudioPlaybackEngine {
 public:
   AudioPlaybackEngine();
@@ -199,9 +264,24 @@ private:
   std::atomic<bool> fShuttingDown{false};
   std::atomic<bool> fInCallback{false};
   std::atomic<bool> fStopping{false};
+  std::atomic<int32> fZeroReadCount{0};
   std::atomic<bool> fIsStreaming{false}; ///< True when playing a URL stream.
   class NetworkAudioStreamIO *fNetworkStream = nullptr;
   ///@}
+
+  AudioRingBuffer fPrebufferRing;
+  std::atomic<bool> fUsePrebuffer{false};
+  std::atomic<bool> fPrebufferRunning{false};
+  std::atomic<bool> fReaderEof{false};
+  thread_id fPrebufferThread = -1;
+  int fPrebufferFrameSize = 4; ///< Native decoded-track frame size (bytes);
+                                ///< set before the thread starts, read only
+                                ///< by that thread while it runs.
+
+  void _StartPrebufferThread(int frameSize);
+  void _StopPrebufferThread();
+  void _PrebufferThreadFunc();
+  static int32 _PrebufferThreadEntry(void *cookie);
 
   /** @name Notification */
   ///@{

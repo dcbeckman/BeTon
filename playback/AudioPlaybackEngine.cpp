@@ -282,6 +282,8 @@ void AudioPlaybackEngine::_CleanupMedia() {
     snooze(50000);
   }
 
+  _StopPrebufferThread();
+
   if (fPlayer) {
     snooze(20000);
     delete fPlayer;
@@ -520,9 +522,13 @@ int64 AudioPlaybackEngine::_FillResampled(void *buffer, int64 wantFrames,
     int64 srcFrames = srcNeed;
     status_t ret = fTrack->ReadFrames(fResampleScratch.data(), &srcFrames);
     if (ret != B_OK || srcFrames <= 0) {
-      hitEof = true;
+      int32 zeroCount = fZeroReadCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (zeroCount > 15 || ret == B_LAST_BUFFER_ERROR) {
+        hitEof = true;
+      }
       continue; // flush on the next pass
     }
+    fZeroReadCount.store(0, std::memory_order_relaxed);
     outFilled += fResampler.Convert(fResampleScratch.data(), srcFrames, dst,
                                     need);
   }
@@ -663,6 +669,61 @@ void AudioPlaybackEngine::_SilenceMidi() {
   fMidiSynth->SetVolume(0.0);
 }
 
+void AudioPlaybackEngine::_StartPrebufferThread(int frameSize) {
+  _StopPrebufferThread();
+  fPrebufferFrameSize = frameSize > 0 ? frameSize : 4;
+  fReaderEof.store(false, std::memory_order_relaxed);
+  fPrebufferRing.Init(524288);
+  fPrebufferRunning.store(true, std::memory_order_relaxed);
+  fPrebufferThread = spawn_thread(_PrebufferThreadEntry, "cd_prebuffer", B_NORMAL_PRIORITY, this);
+  if (fPrebufferThread >= 0) {
+    resume_thread(fPrebufferThread);
+    fUsePrebuffer.store(true, std::memory_order_relaxed);
+    DEBUG_PRINT("Background prebuffer thread started\n");
+  }
+}
+
+void AudioPlaybackEngine::_StopPrebufferThread() {
+  fUsePrebuffer.store(false, std::memory_order_relaxed);
+  if (fPrebufferRunning.exchange(false)) {
+    if (fPrebufferThread >= 0) {
+      status_t exitVal;
+      wait_for_thread(fPrebufferThread, &exitVal);
+      fPrebufferThread = -1;
+    }
+  }
+  fPrebufferRing.Reset();
+}
+
+int32 AudioPlaybackEngine::_PrebufferThreadEntry(void *cookie) {
+  AudioPlaybackEngine *self = static_cast<AudioPlaybackEngine *>(cookie);
+  if (self)
+    self->_PrebufferThreadFunc();
+  return 0;
+}
+
+void AudioPlaybackEngine::_PrebufferThreadFunc() {
+  const int frameSize = fPrebufferFrameSize;
+  const int64 kFramesPerRead = 4096;
+  const size_t kBytesPerRead = (size_t)kFramesPerRead * frameSize;
+  std::vector<uint8> scratch(kBytesPerRead);
+  while (fPrebufferRunning.load(std::memory_order_relaxed)) {
+    if (!fReaderEof.load(std::memory_order_relaxed) &&
+        fPrebufferRing.AvailableWrite() >= kBytesPerRead) {
+      int64 framesToRead = kFramesPerRead;
+      status_t ret = fTrack ? fTrack->ReadFrames(scratch.data(), &framesToRead) : B_ERROR;
+      if (ret == B_OK && framesToRead > 0) {
+        size_t bytesRead = (size_t)framesToRead * frameSize;
+        fPrebufferRing.Write(scratch.data(), bytesRead);
+      } else {
+        fReaderEof.store(true, std::memory_order_relaxed);
+      }
+    } else {
+      snooze(10000);
+    }
+  }
+}
+
 /**
  * @brief Plays the track at the specified index in the queue.
  *
@@ -677,6 +738,7 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+  fZeroReadCount.store(0);
 #if ENABLE_LOCAL_OUTPUT
   // Default to no compensation; the direct-connect path enables it on success.
   fDirectCompActive.store(false, std::memory_order_relaxed);
@@ -968,6 +1030,27 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
 
   fPlayer->Start();
   fPlayer->SetHasData(true);
+
+  // The prebuffer thread reads native frames from fTrack in the background
+  // and is the callback's only reader on that path. When the direct-output
+  // resampler is active, _PlayBuffer's _FillResampled() branch reads fTrack
+  // itself instead (see below) — starting the prebuffer thread too would
+  // have two threads calling BMediaTrack::ReadFrames() concurrently.
+#if ENABLE_LOCAL_OUTPUT
+  if (!fResampler.IsActive()) {
+    const int nativeFrameSize =
+        (raf.format & media_raw_audio_format::B_AUDIO_SIZE_MASK) *
+        raf.channel_count;
+    _StartPrebufferThread(nativeFrameSize);
+  }
+#else
+  {
+    const int nativeFrameSize =
+        (raf.format & media_raw_audio_format::B_AUDIO_SIZE_MASK) *
+        raf.channel_count;
+    _StartPrebufferThread(nativeFrameSize);
+  }
+#endif
 
   if (fTarget.IsValid()) {
     BMessage m(MSG_NOW_PLAYING);
@@ -1701,11 +1784,49 @@ void AudioPlaybackEngine::_PlayBuffer(
   }
 #endif
 
+  if (self->fUsePrebuffer.load(std::memory_order_relaxed)) {
+    size_t readBytes = self->fPrebufferRing.Read((uint8 *)buffer, size);
+    if (readBytes > 0) {
+      self->fZeroReadCount.store(0, std::memory_order_relaxed);
+      if (frameSize > 0) {
+        int64 readFrames = (int64)readBytes / frameSize;
+        self->fCurrentPos +=
+            (bigtime_t)((readFrames * 1000000LL) / (int)format.frame_rate);
+      }
+      self->_ApplyFade(buffer, readBytes, format);
+      if (readBytes < size)
+        memset((uint8 *)buffer + readBytes, 0, size - readBytes);
+    } else if (self->fReaderEof.load(std::memory_order_relaxed)) {
+      memset(buffer, 0, size);
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true)) {
+        if (self->fTarget.IsValid()) {
+          BMessage m(MSG_TRACK_ENDED);
+          self->fTarget.SendMessage(&m);
+        }
+      }
+    } else {
+      memset(buffer, 0, size);
+    }
+    self->fInCallback.store(false, std::memory_order_relaxed);
+    return;
+  }
+
   status_t ret = B_ERROR;
   if (self->fTrack && frames > 0)
     ret = self->fTrack->ReadFrames(buffer, &frames);
 
+  static int sCbCount = 0;
+  if (++sCbCount % 50 == 0 || ret != B_OK || frames <= 0) {
+    DEBUG_PRINT("_PlayBuffer cb=%d ret=%s (%d) frames=%lld size=%zu vol=%.2f\n",
+                sCbCount, strerror(ret), (int)ret, (long long)frames, size,
+                self->fVolume.load(std::memory_order_relaxed));
+  }
+
   if (ret == B_OK && frames > 0) {
+    self->fZeroReadCount.store(0, std::memory_order_relaxed);
     self->fCurrentPos +=
         (bigtime_t)((frames * 1000000LL) / (int)format.frame_rate);
     size_t produced = (size_t)frames * frameSize;
@@ -1730,18 +1851,19 @@ void AudioPlaybackEngine::_PlayBuffer(
       snooze(10000); ///< Prevent tight loop if network is just slow
   } else {
     /// End of stream or error (local files only)
-    bool expected = false;
-    if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
-        !self->fStopping.load(std::memory_order_relaxed) &&
-        self->fAtEnd.compare_exchange_strong(expected, true)) {
+    memset(buffer, 0, size);
+    int32 zeroCount = self->fZeroReadCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (zeroCount > 15 || ret == B_LAST_BUFFER_ERROR) {
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true)) {
 
-      memset(buffer, 0, size);
-      if (self->fTarget.IsValid()) {
-        BMessage m(MSG_TRACK_ENDED);
-        self->fTarget.SendMessage(&m);
+        if (self->fTarget.IsValid()) {
+          BMessage m(MSG_TRACK_ENDED);
+          self->fTarget.SendMessage(&m);
+        }
       }
-    } else {
-      memset(buffer, 0, size);
     }
   }
 
