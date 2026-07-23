@@ -48,6 +48,7 @@ public:
   SingleColumnListView *AlbumView() const;
   /** @brief Returns the main media content table view. */
   MediaTableView *ContentView() const;
+  const std::vector<MediaItem> &ActiveItems() const { return fActiveItems; }
 
   /**
    * @brief Updates the filtered views based on the full database and current

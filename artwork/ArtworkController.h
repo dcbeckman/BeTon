@@ -1,8 +1,10 @@
 #ifndef ARTWORK_CONTROLLER_H
 #define ARTWORK_CONTROLLER_H
 
+#include <Bitmap.h>
 #include <Point.h>
 #include <String.h>
+#include <map>
 #include <vector>
 
 class BMessage;
@@ -51,6 +53,12 @@ public:
    * @param path Local media file path.
    */
   void FetchEmbeddedCoverBitmap(const BString &path);
+
+  /**
+   * @brief Fetches album cover art for CDDA tracks via MusicBrainz and CoverArt Archive.
+   * @param path Local CDDA track path.
+   */
+  void FetchCddaCoverBitmap(const BString &path);
 
   /**
    * @brief Applies album cover bytes to a single file via metadata service.
@@ -120,6 +128,7 @@ private:
   /** Window context used to access controllers, services, and UI targets. */
   MainWindow *fWindow;
   class BFilePanel *fOpenPanel{nullptr};
+  std::map<BString, BBitmap *> fCddaCoverCache;
 };
 
 #endif // ARTWORK_CONTROLLER_H

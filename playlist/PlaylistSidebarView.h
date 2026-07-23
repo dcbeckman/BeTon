@@ -12,7 +12,7 @@
 class PlaylistLibrary;
 
 // Logical source types shown in the playlist sidebar.
-enum class PlaylistItemKind { Library, Playlist, Folder, Radio, DLNA };
+enum class PlaylistItemKind { Library, CD, Playlist, Folder, Radio, DLNA };
 
 struct PlaylistRow {
   /** @name Data */
@@ -21,6 +21,11 @@ struct PlaylistRow {
   bool writable;
   PlaylistItemKind kind;
   ///@}
+};
+
+struct CDItemInfo {
+  BString label;
+  BString path;
 };
 
 class PlaylistSidebarView : public SingleColumnListView {
@@ -48,6 +53,10 @@ public:
   void SetIsUnwritableAt(int32 index, bool v);
   void SetIsUnwritableByName(const BString &name, bool v);
   bool RemovePlaylistAt(int32 index);
+
+  void SyncCDItems(const std::vector<CDItemInfo> &cds);
+  int32 SetCDItem(const char *title, const char *path);
+  void RemoveCDItem();
 
   int32 AddItem(const char *title, bool writable);
   int32 AddItem(const char *title, bool writable, PlaylistItemKind kind);
@@ -86,6 +95,7 @@ private:
   bool fIsDragging{false};
 
   mutable BBitmap *fIconLibrary = nullptr;
+  mutable BBitmap *fIconCd = nullptr;
   mutable BBitmap *fIconPlaylist = nullptr;
   mutable BBitmap *fIconFolder = nullptr;
   mutable BBitmap *fIconRadio = nullptr;

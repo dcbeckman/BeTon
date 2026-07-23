@@ -28,6 +28,10 @@
 #include <StringView.h>
 #include <TextControl.h>
 #include <Window.h>
+#include <VolumeRoster.h>
+#include <Volume.h>
+#include <NodeMonitor.h>
+#include <fs_info.h>
 #include "IconButtonView.h"
 #include <atomic>
 #include <functional>
@@ -105,13 +109,14 @@ public:
   void UpdateFilteredViews(bool preserveScroll = false);
   void UpdateFileInfo();
   void UpdateStatus(const BString &text, bool isPermanent = false);
-  /// True only for user playlists (not Library/Radio/DLNA sources).
+  /// True only for user playlists (not Library/Radio/DLNA/CD sources).
   bool IsPlaylistSelected() const {
-    return !fIsLibraryMode && !fIsFolderMode && !fIsRadioMode && !fIsDlnaMode;
+    return !fIsLibraryMode && !fIsFolderMode && !fIsRadioMode && !fIsDlnaMode && !fIsCDMode;
   }
   bool IsFolderMode() const { return fIsFolderMode; }
   bool IsRadioMode() const { return fIsRadioMode; }
   bool IsDlnaMode() const { return fIsDlnaMode; }
+  bool IsCDMode() const { return fIsCDMode; }
 
   ///@}
 
@@ -179,6 +184,8 @@ private:
 #if ENABLE_DLNA_OUTPUT
   void _SetOutputMenuVisible(bool visible);
 #endif
+  void _InitCDVolumeMonitoring();
+  void _CheckMountedCDs();
 
 
   /** @name Data & State */
@@ -189,6 +196,9 @@ private:
   bool fIsFolderMode = false; ///< True = live folder source view
   bool fIsRadioMode = false;  ///< True = Radio station view
   bool fIsDlnaMode = false;   ///< True = DLNA server browsing view
+  bool fIsCDMode = false;     ///< True = Audio CD source view
+  BString fCDPath;
+  BVolumeRoster fVolumeRoster;
   BString fPlaylistPath;
   BString fCurrentPlaylistName;
 

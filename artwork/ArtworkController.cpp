@@ -29,12 +29,24 @@
 #include <TranslationUtils.h>
 #include <Url.h>
 #include <UrlProtocolRoster.h>
-#include <unistd.h>
+#include <fs_info.h>
+#include <memory>
 
 #undef B_TRANSLATION_CONTEXT
-#define B_TRANSLATION_CONTEXT "MetadataPropertiesWindow"
+#define B_TRANSLATION_CONTEXT "ArtworkController"
 
-#include <memory>
+static bool IsCddaPath(const BString &path) {
+  if (path.IsEmpty())
+    return false;
+  entry_ref ref;
+  if (get_ref_for_path(path.String(), &ref) == B_OK) {
+    fs_info info;
+    if (fs_stat_dev(ref.device, &info) == B_OK) {
+      return (strcmp(info.fsh_name, "cdda") == 0);
+    }
+  }
+  return false;
+}
 
 /**
  * @brief Constructs the artwork controller.
@@ -88,6 +100,17 @@ void ArtworkController::HandleCoverBitmapReady(BMessage *msg) {
   if (msg->FindString("path", &path) != B_OK) {
     delete bmp;
     return;
+  }
+
+  BString cddaCacheKey;
+  if (msg->FindString("cdda_cache_key", &cddaCacheKey) == B_OK && !cddaCacheKey.IsEmpty()) {
+    if (fCddaCoverCache.find(cddaCacheKey) == fCddaCoverCache.end()) {
+      if (bmp && bmp->IsValid()) {
+        fCddaCoverCache[cddaCacheKey] = new BBitmap(bmp);
+      } else {
+        fCddaCoverCache[cddaCacheKey] = nullptr;
+      }
+    }
   }
 
   if (fWindow->fRadioStationController &&
@@ -218,6 +241,11 @@ void ArtworkController::DownloadCoverBitmap(const BString &path,
  * @brief Extracts embedded artwork from a local media file asynchronously.
  */
 void ArtworkController::FetchEmbeddedCoverBitmap(const BString &path) {
+  if (IsCddaPath(path)) {
+    FetchCddaCoverBitmap(path);
+    return;
+  }
+
   BMessenger target(fWindow);
   BString pathStr = path;
   fWindow->LaunchThread("CoverFetch", [target, pathStr]() {
@@ -233,6 +261,103 @@ void ArtworkController::FetchEmbeddedCoverBitmap(const BString &path) {
     if (target.IsValid()) {
       BMessage reply(MSG_COVER_BITMAP_READY);
       reply.AddString("path", pathStr);
+      if (bmp)
+        reply.AddPointer("bitmap", bmp);
+      if (target.SendMessage(&reply) != B_OK)
+        delete bmp;
+    } else {
+      delete bmp;
+    }
+  });
+}
+
+void ArtworkController::FetchCddaCoverBitmap(const BString &path) {
+  if (!fWindow || !fWindow->fShowCoverArt || path.IsEmpty())
+    return;
+
+  BNode node(path.String());
+  if (node.InitCheck() != B_OK)
+    return;
+
+  char buf[512];
+  BString artist;
+  BString album;
+
+  memset(buf, 0, sizeof(buf));
+  if (node.ReadAttr("Audio:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    artist = buf;
+  else if (node.ReadAttr("Media:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    artist = buf;
+  else if (node.ReadAttr("cdda/artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    artist = buf;
+
+  memset(buf, 0, sizeof(buf));
+  if (node.ReadAttr("Audio:Album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    album = buf;
+  else if (node.ReadAttr("Media:Title", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    album = buf;
+  else if (node.ReadAttr("cdda/album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+    album = buf;
+
+  artist.Trim();
+  album.Trim();
+
+  BString cacheKey;
+  if (!artist.IsEmpty() || !album.IsEmpty()) {
+    cacheKey << artist << "\t" << album;
+  } else {
+    BPath p(path.String());
+    if (p.GetParent(&p) == B_OK) {
+      cacheKey = p.Path();
+    } else {
+      cacheKey = path;
+    }
+  }
+
+  auto it = fCddaCoverCache.find(cacheKey);
+  if (it != fCddaCoverCache.end()) {
+    if (it->second != nullptr && it->second->IsValid()) {
+      BBitmap *cachedBmp = new BBitmap(it->second);
+      BMessage reply(MSG_COVER_BITMAP_READY);
+      reply.AddString("path", path);
+      reply.AddPointer("bitmap", cachedBmp);
+      fWindow->PostMessage(&reply);
+    }
+    return;
+  }
+
+  BMessenger target(fWindow);
+  BString pathStr = path;
+  MainWindow *win = fWindow;
+
+  fWindow->LaunchThread("CDDACoverFetch", [target, pathStr, artist, album, cacheKey, win]() {
+    BBitmap *bmp = nullptr;
+
+    if (win->fMbClient && (!artist.IsEmpty() || !album.IsEmpty())) {
+      std::vector<MBHit> hits = win->fMbClient->SearchRelease(artist, album);
+      if (hits.empty() && !artist.IsEmpty() && !album.IsEmpty()) {
+        hits = win->fMbClient->SearchRecording(artist, album, "");
+      }
+
+      if (!hits.empty()) {
+        BString releaseId = hits[0].releaseId;
+        if (!releaseId.IsEmpty()) {
+          std::vector<uint8_t> imageData;
+          BString mime;
+          if (win->fMbClient->FetchCover(releaseId, imageData, &mime, 500, false)) {
+            if (!imageData.empty()) {
+              BMemoryIO io(imageData.data(), imageData.size());
+              bmp = BTranslationUtils::GetBitmap(&io);
+            }
+          }
+        }
+      }
+    }
+
+    if (target.IsValid()) {
+      BMessage reply(MSG_COVER_BITMAP_READY);
+      reply.AddString("path", pathStr);
+      reply.AddString("cdda_cache_key", cacheKey);
       if (bmp)
         reply.AddPointer("bitmap", bmp);
       if (target.SendMessage(&reply) != B_OK)
@@ -340,6 +465,10 @@ void ArtworkController::RequestEmbeddedCover(BMessage *msg) {
 ArtworkController::~ArtworkController() {
   delete fOpenPanel;
   fOpenPanel = nullptr;
+  for (auto &pair : fCddaCoverCache) {
+    delete pair.second;
+  }
+  fCddaCoverCache.clear();
 }
 
 std::vector<BString> ArtworkController::GetMainCoverTargetPaths() const {

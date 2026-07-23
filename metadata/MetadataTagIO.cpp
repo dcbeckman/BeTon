@@ -995,6 +995,13 @@ bool MetadataTagIO::ExtractEmbeddedCover(const BPath &file, CoverBlob &outCover)
   if (!p)
     return false;
 
+  entry_ref ref;
+  if (get_ref_for_path(p, &ref) == B_OK) {
+    fs_info info;
+    if (fs_stat_dev(ref.device, &info) == B_OK && strcmp(info.fsh_name, "cdda") == 0)
+      return false;
+  }
+
   {
     TagLib::MPEG::File f(p);
     if (f.isOpen()) {

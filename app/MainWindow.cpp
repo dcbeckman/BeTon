@@ -531,6 +531,7 @@ MainWindow::MainWindow()
 #endif
 
   AddCommonFilter(new WindowClickFilter(this));
+  _InitCDVolumeMonitoring();
 }
 
 /**
@@ -990,6 +991,16 @@ void MainWindow::WindowActivated(bool active) {
  * @param msg The received message.
  */
 void MainWindow::MessageReceived(BMessage *msg) {
+  if (msg->what == B_NODE_MONITOR) {
+    int32 opcode = 0;
+    if (msg->FindInt32("opcode", &opcode) == B_OK) {
+      if (opcode == B_DEVICE_MOUNTED || opcode == B_DEVICE_UNMOUNTED) {
+        _CheckMountedCDs();
+        return;
+      }
+    }
+  }
+
   if (_HandleViewMessage(msg))
     return;
   if (_HandlePlaybackMessage(msg))
@@ -1088,9 +1099,12 @@ status_t MainWindow::_ThreadEntry(void *data) {
 void MainWindow::UpdateFilteredViews(bool preserveScroll) {
   if (fLibraryManager) {
     const auto &items =
-        (fIsRadioMode || fIsDlnaMode) ? fRadioItems : fAllItems;
+        (fIsRadioMode || fIsDlnaMode) ? fRadioItems :
+        (fIsCDMode) ? fLibraryManager->ActiveItems() : fAllItems;
     BString context = "Library";
-    if (fIsRadioMode)
+    if (fIsCDMode)
+      context = "CD";
+    else if (fIsRadioMode)
       context = "Radio";
     else if (fIsDlnaMode)
       context = "DLNA";
@@ -1102,7 +1116,7 @@ void MainWindow::UpdateFilteredViews(bool preserveScroll) {
     fLibraryManager->UpdateFilteredViews(
         items, fIsLibraryMode || fIsRadioMode || fIsDlnaMode,
         context,
-        fSearchField->Text(), preserveScroll, true, IsPlaylistSelected());
+        fSearchField->Text(), preserveScroll, true, IsPlaylistSelected() || fIsCDMode);
     if (!fIsRadioMode && !fIsDlnaMode) {
       if (fStatusBarController)
         fStatusBarController->UpdateLibraryStatus();
@@ -1402,5 +1416,105 @@ void MainWindow::ApplyColors() {
 
   if (fPlaylistLibrary && fPlaylistLibrary->View()) {
     fPlaylistLibrary->View()->SetSelectionColor(selColor);
+  }
+}
+
+void MainWindow::_InitCDVolumeMonitoring() {
+  fVolumeRoster.StartWatching(BMessenger(this));
+  _CheckMountedCDs();
+}
+
+void MainWindow::_CheckMountedCDs() {
+  BVolumeRoster roster;
+  BVolume vol;
+  roster.Rewind();
+
+  std::vector<CDItemInfo> mountedCDs;
+
+  while (roster.GetNextVolume(&vol) == B_OK) {
+    fs_info info;
+    if (fs_stat_dev(vol.Device(), &info) == B_OK && strcmp(info.fsh_name, "cdda") == 0) {
+      BDirectory rootDir;
+      if (vol.GetRootDirectory(&rootDir) == B_OK) {
+        BEntry rootEntry;
+        rootDir.GetEntry(&rootEntry);
+        BPath rootPath;
+        if (rootEntry.GetPath(&rootPath) == B_OK) {
+          BString cdPath = rootPath.Path();
+          BNode node(&rootEntry);
+
+          char buf[256];
+          BString artist;
+          BString album;
+
+          memset(buf, 0, sizeof(buf));
+          if (node.ReadAttr("Audio:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+          else if (node.ReadAttr("Media:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+          else if (node.ReadAttr("cdda/artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+
+          memset(buf, 0, sizeof(buf));
+          if (node.ReadAttr("Audio:Album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+          else if (node.ReadAttr("Media:Title", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+          else if (node.ReadAttr("cdda/album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+
+          artist.Trim();
+          album.Trim();
+
+          char volName[B_FILE_NAME_LENGTH];
+          memset(volName, 0, sizeof(volName));
+          vol.GetName(volName);
+
+          BString label;
+          if (!artist.IsEmpty() && !album.IsEmpty()) {
+            label << artist << " - " << album;
+          } else if (!artist.IsEmpty()) {
+            label << artist << " - Audio CD";
+          } else if (!album.IsEmpty()) {
+            label = album;
+          } else if (volName[0] != '\0' && strcmp(volName, "Audio CD") != 0) {
+            label = volName;
+          } else {
+            label = "Audio CD";
+          }
+
+          int count = 1;
+          for (const auto &existing : mountedCDs) {
+            BString prefix = label;
+            prefix << " (";
+            if (existing.label == label || existing.label.StartsWith(prefix)) {
+              count++;
+            }
+          }
+          if (count > 1) {
+            label << " (" << count << ")";
+          }
+
+          mountedCDs.push_back({label, cdPath});
+        }
+      }
+    }
+  }
+
+  if (fPlaylistLibrary && fPlaylistLibrary->View()) {
+    fPlaylistLibrary->View()->SyncCDItems(mountedCDs);
+  }
+
+  if (!mountedCDs.empty()) {
+    fCDPath = mountedCDs[0].path;
+  } else {
+    if (!fCDPath.IsEmpty()) {
+      if (fIsCDMode) {
+        if (fPlaylistLibrary && fPlaylistLibrary->View()) {
+          fPlaylistLibrary->View()->SelectByName("Library");
+        }
+      }
+      fCDPath.Truncate(0);
+    }
   }
 }
