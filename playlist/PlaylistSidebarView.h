@@ -76,7 +76,9 @@ private:
   void SetHoverIndex(int32 idx);
 
   void _EnsureIconsLoaded() const;
-  BBitmap *_IconFor(PlaylistItemKind kind) const;
+  BBitmap *_IconFor(PlaylistItemKind kind, const BString &path) const;
+  BBitmap *_CdIconFor(const BString &path) const;
+  void _PruneCdIcons(const std::vector<CDItemInfo> &mountedCDs);
 
   int32 _FirstPlaylistIndex() const;
   void _ReorderItem(int32 from, int32 to);
@@ -93,6 +95,14 @@ private:
   int32 fDropLineIndex{-1};
   BPoint fDragStartPoint;
   bool fIsDragging{false};
+
+  /// Per-disc volume icon, keyed by mount path. A null bitmap means the disc
+  /// has no icon of its own and the generic fIconCd should be drawn instead.
+  struct CdIconEntry {
+    BString path;
+    BBitmap *icon;
+  };
+  mutable std::vector<CdIconEntry> fIconCdByPath;
 
   mutable BBitmap *fIconLibrary = nullptr;
   mutable BBitmap *fIconCd = nullptr;

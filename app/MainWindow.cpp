@@ -1506,7 +1506,18 @@ void MainWindow::_CheckMountedCDs() {
   }
 
   if (!mountedCDs.empty()) {
-    fCDPath = mountedCDs[0].path;
+    // Keep pointing at the disc the user is actually on. A rescan is triggered
+    // by any mount/unmount, so blindly taking mountedCDs[0] here would drag a
+    // second-drive selection back to the first drive.
+    bool currentStillMounted = false;
+    for (const auto &cd : mountedCDs) {
+      if (cd.path == fCDPath) {
+        currentStillMounted = true;
+        break;
+      }
+    }
+    if (!currentStillMounted)
+      fCDPath = mountedCDs[0].path;
   } else {
     if (!fCDPath.IsEmpty()) {
       if (fIsCDMode) {

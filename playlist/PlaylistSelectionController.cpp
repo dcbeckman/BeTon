@@ -206,14 +206,16 @@ void PlaylistSelectionController::ShowCDPlaylistSource(const BString &name) {
 
   BString cdPath = fWindow->fCDPath;
   int32 selected = fWindow->fPlaylistLibrary->View()->CurrentSelection();
-  if (selected >= 0) {
+  if (selected >= 0 &&
+      fWindow->fPlaylistLibrary->View()->KindAt(selected) == PlaylistItemKind::CD) {
     BString selPath = fWindow->fPlaylistLibrary->View()->PathAt(selected);
     if (!selPath.IsEmpty())
       cdPath = selPath;
   }
-  if (cdPath.IsEmpty() && !fWindow->fCDPath.IsEmpty()) {
-    cdPath = fWindow->fCDPath;
-  }
+
+  // Remember which drive we're browsing so a later volume rescan (or anything
+  // else falling back to fCDPath) stays on this disc rather than the first one.
+  fWindow->fCDPath = cdPath;
 
   std::vector<MediaItem> cdTracks;
   if (!cdPath.IsEmpty()) {

@@ -38,7 +38,12 @@ static constexpr int32 ICON_DLNA_ID = 1004;
 static constexpr int32 ICON_FOLDER_ID = 1006;
 static constexpr int32 ICON_CD_ID = 1007;
 
-static BBitmap *LoadSystemCDIcon(float size, const char *cdPath = nullptr) {
+/*!	Icon of the volume mounted at \a cdPath, or NULL if it has none.
+
+	Deliberately scoped to the one disc: with several drives mounted, falling
+	back to "any cdda volume" would hand every sidebar row the same icon.
+*/
+static BBitmap *LoadSystemCDIcon(float size, const char *cdPath) {
   BVolume vol;
   bool found = false;
 
@@ -49,18 +54,6 @@ static BBitmap *LoadSystemCDIcon(float size, const char *cdPath = nullptr) {
       vol.SetTo(ref.device);
       if (vol.InitCheck() == B_OK) {
         found = true;
-      }
-    }
-  }
-
-  if (!found) {
-    BVolumeRoster roster;
-    roster.Rewind();
-    while (roster.GetNextVolume(&vol) == B_OK) {
-      fs_info info;
-      if (fs_stat_dev(vol.Device(), &info) == B_OK && strcmp(info.fsh_name, "cdda") == 0) {
-        found = true;
-        break;
       }
     }
   }
@@ -136,7 +129,11 @@ PlaylistSidebarView::PlaylistSidebarView(const char *name, BMessenger target, Pl
   fContextMenu->SetTargetForItems(this);
 }
 
-PlaylistSidebarView::~PlaylistSidebarView() { delete fContextMenu; }
+PlaylistSidebarView::~PlaylistSidebarView() {
+  delete fContextMenu;
+  for (auto &entry : fIconCdByPath)
+    delete entry.icon;
+}
 
 void PlaylistSidebarView::SelectionChanged(int32 index) {
   if (index >= 0) {
@@ -509,10 +506,9 @@ void PlaylistSidebarView::_EnsureIconsLoaded() const {
     fIconSize = rowH * 0.7f;
     fIconLibrary = LoadVectorIconFromResourceID(ICON_LIB_ID, fIconSize);
   }
+  // Generic fallback only - a mounted disc's own icon comes from _CdIconFor().
   if (!fIconCd) {
-    fIconCd = LoadSystemCDIcon(fIconSize);
-    if (!fIconCd)
-      fIconCd = LoadVectorIconFromResourceID(ICON_CD_ID, fIconSize);
+    fIconCd = LoadVectorIconFromResourceID(ICON_CD_ID, fIconSize);
     if (!fIconCd)
       fIconCd = fIconLibrary;
   }
@@ -535,13 +531,46 @@ void PlaylistSidebarView::_EnsureIconsLoaded() const {
   }
 }
 
-BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind) const {
+BBitmap *PlaylistSidebarView::_CdIconFor(const BString &path) const {
+  if (path.IsEmpty())
+    return fIconCd;
+
+  for (const auto &entry : fIconCdByPath) {
+    if (entry.path == path)
+      return entry.icon ? entry.icon : fIconCd;
+  }
+
+  // First time we've drawn this disc: ask its volume for an icon. A null
+  // result is cached too, so a disc without one doesn't re-query every frame.
+  BBitmap *icon = LoadSystemCDIcon(fIconSize, path.String());
+  fIconCdByPath.push_back(CdIconEntry{path, icon});
+  return icon ? icon : fIconCd;
+}
+
+void PlaylistSidebarView::_PruneCdIcons(const std::vector<CDItemInfo> &mountedCDs) {
+  for (size_t i = fIconCdByPath.size(); i-- > 0;) {
+    bool stillMounted = false;
+    for (const auto &cd : mountedCDs) {
+      if (cd.path == fIconCdByPath[i].path) {
+        stillMounted = true;
+        break;
+      }
+    }
+    if (!stillMounted) {
+      delete fIconCdByPath[i].icon;
+      fIconCdByPath.erase(fIconCdByPath.begin() + i);
+    }
+  }
+}
+
+BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind,
+                                       const BString &path) const {
   _EnsureIconsLoaded();
   switch (kind) {
   case PlaylistItemKind::Library:
     return fIconLibrary;
   case PlaylistItemKind::CD:
-    return fIconCd;
+    return _CdIconFor(path);
   case PlaylistItemKind::Playlist:
     return fIconPlaylist;
   case PlaylistItemKind::Folder:
@@ -555,17 +584,9 @@ BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind) const {
 }
 
 void PlaylistSidebarView::SyncCDItems(const std::vector<CDItemInfo> &mountedCDs) {
-  if (!mountedCDs.empty()) {
-    if (fIconCd && fIconCd != fIconLibrary) {
-      delete fIconCd;
-      fIconCd = nullptr;
-    }
-    fIconCd = LoadSystemCDIcon(fIconSize, mountedCDs[0].path.String());
-    if (!fIconCd)
-      fIconCd = LoadVectorIconFromResourceID(ICON_CD_ID, fIconSize);
-    if (!fIconCd)
-      fIconCd = fIconLibrary;
-  }
+  // Each disc gets its own icon, resolved lazily on first draw by _CdIconFor();
+  // drop the cached icons of discs that have gone away.
+  _PruneCdIcons(mountedCDs);
 
   bool selectedCDRemoved = false;
 
@@ -725,7 +746,7 @@ void PlaylistSidebarView::Draw(BRect updateRect) {
         rowRect.top + floorf((rowRect.Height() + 1 - fIconSize) / 2.0f);
 
     if ((size_t)i < fRows.size()) {
-      if (BBitmap *icon = _IconFor(fRows[i].kind)) {
+      if (BBitmap *icon = _IconFor(fRows[i].kind, PathAt(i))) {
 
         SetDrawingMode(B_OP_ALPHA);
         SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
