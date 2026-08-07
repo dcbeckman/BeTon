@@ -6,7 +6,9 @@
 #define MSG_START_SCAN 'msta'       ///< Start the directory scan.
 #define MSG_SCAN_DONE 'mdon'        ///< Scanning is complete.
 #define MSG_SCAN_FINISHED 'scfd'    ///< Final cleanup after scan.
-#define MSG_SCAN_PROGRESS 'mprg'    ///< Periodic progress update from scanner.
+#define MSG_SCAN_PROGRESS 'mprg'    ///< Progress update (scanner->cache, cache->UI).
+#define MSG_SCAN_TOTALS 'mtot'      ///< Scanner reports its counted workload to the cache.
+#define MSG_SCAN_TICK 'mtck'        ///< UI timer: repaint scan status between updates.
 #define MSG_MEDIA_ITEM_FOUND 'mitm' ///< (Legacy) Single item found.
 #define MSG_MEDIA_BATCH 'mbat'      ///< Batch of items from scanner to cache.
 #define MSG_MEDIA_ITEM_REMOVED 'mirm' ///< Item removed from library.
@@ -26,6 +28,10 @@
 #define MSG_ATTR_POLL 'apol' ///< Periodic poll for BFS attribute changes.
 #define MSG_WATCH_FOLDER 'wtch'       ///< Watch directory node for live folder updates.
 #define MSG_CACHE_FLUSH 'cfls'        ///< Throttled cache write-back tick.
+#define MSG_CACHE_CORRUPT 'ccrp'      ///< Cache file was unreadable and has been discarded.
+#define MSG_CACHE_EMPTY 'cmty'        ///< Cache loaded fine but holds no entries.
+#define MSG_SCAN_FILES 'scfl'         ///< Queue individual file paths for (re)caching.
+#define MSG_SCAN_FILES_STEP 'scfs'    ///< Internal: process the next chunk of queued files.
 ///@}
 
 /** @name Playback Control */

@@ -23,6 +23,16 @@ bool LibraryMessageHandler::HandleMessage(BMessage *msg) {
     break;
   }
 
+  case MSG_CACHE_CORRUPT: {
+    fWindow->fLibraryController->HandleCacheCorrupt(msg);
+    break;
+  }
+
+  case MSG_CACHE_EMPTY: {
+    fWindow->fLibraryController->HandleCacheEmpty(msg);
+    break;
+  }
+
   case MSG_DELETE_ITEM: {
     fWindow->fPlaylistEditController->DeleteSelectedPlaylistItems();
     break;
@@ -35,6 +45,11 @@ bool LibraryMessageHandler::HandleMessage(BMessage *msg) {
 
   case MSG_SCAN_PROGRESS: {
     fWindow->fLibraryController->UpdateScanProgress(msg);
+    break;
+  }
+
+  case MSG_SCAN_TICK: {
+    fWindow->fLibraryController->TickScanStatus();
     break;
   }
 
