@@ -15,6 +15,7 @@
 #include <Volume.h>
 #include <fs_attr.h>
 
+#include <Autolock.h>
 #include <taglib/attachedpictureframe.h>
 #include <taglib/audioproperties.h>
 #include <taglib/fileref.h>
@@ -234,8 +235,17 @@ static uint32 _byteToRating(uint8_t val) {
  * @param out Output structure for metadata.
  * @return True if successful, false otherwise.
  */
+BLocker &MetadataTagIO::TagLibLock() {
+  // Function-local static: constructed on first use, which keeps it safe
+  // regardless of static initialisation order across translation units.
+  static BLocker sLock("taglib");
+  return sLock;
+}
+
 bool MetadataTagIO::ReadTags(const BPath &path, TagData &out,
                              bool bfsFallback) {
+  BAutolock guard(TagLibLock());
+
   if (path.InitCheck() != B_OK)
     return false;
 
@@ -459,6 +469,8 @@ static void set_basic_tags(TagLib::Tag *t, const TagData &td) {
 
 bool MetadataTagIO::WriteTagsToFile(const BPath &path, const TagData &td,
                               const CoverBlob *coverOpt) {
+  BAutolock guard(TagLibLock());
+
   if (path.InitCheck() != B_OK)
     return false;
   if (access(path.Path(), W_OK) != 0) {
@@ -872,6 +884,8 @@ bool MetadataTagIO::WriteBfsAttributes(const BPath &path, const TagData &td,
  */
 bool MetadataTagIO::WriteEmbeddedCover(const BPath &file, const uint8 *data,
                                  size_t size, const char *mimeOpt) {
+  BAutolock guard(TagLibLock());
+
   if (file.InitCheck() != B_OK)
     return false;
   if (access(file.Path(), W_OK) != 0) {
@@ -990,6 +1004,8 @@ bool MetadataTagIO::WriteEmbeddedCover(const BPath &file, const CoverBlob &blob,
  * @brief Extracts embedded cover art from MP3/FLAC/MP4 containers.
  */
 bool MetadataTagIO::ExtractEmbeddedCover(const BPath &file, CoverBlob &outCover) {
+  BAutolock guard(TagLibLock());
+
   outCover.clear();
   const char *p = file.Path();
   if (!p)

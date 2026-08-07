@@ -2,6 +2,7 @@
 #define BETON_METADATA_TAG_IO_H
 #include "Debug.h"
 
+#include <Locker.h>
 #include <Path.h>
 #include <String.h>
 #include <SupportDefs.h>
@@ -157,6 +158,26 @@ namespace MetadataTagIO {
  *        the fallback resurrects values the caller meant to clear.
  * @return True on success, false otherwise.
  */
+/**
+ * @brief The lock every caller must hold while inside TagLib.
+ *
+ * BeTon links TagLib 1.x, whose ByteVector/String use implicit sharing built
+ * on TagLib::RefCounter. That reference count is not safe against concurrent
+ * mutation, and the shared empty/null instances are touched by every parse,
+ * so two threads parsing unrelated files still race on the same counter. The
+ * observed result was a double free inside ID3v2 frame parsing, with the heap
+ * corruption surfacing later as faults in unrelated TagLib code.
+ *
+ * One scanner thread per source directory means that race is otherwise
+ * routine, so every entry into TagLib -- from the scanners, the cache looper
+ * and the window thread alike -- is serialised on this lock. It is recursive,
+ * so nested MetadataTagIO calls are fine.
+ *
+ * Only the tag parsing is serialised: directory walking, stat()ing and the
+ * workload counting pass all still run in parallel.
+ */
+BLocker &TagLibLock();
+
 bool ReadTags(const BPath &path, TagData &out, bool bfsFallback = true);
 
 /**

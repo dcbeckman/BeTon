@@ -4,6 +4,7 @@
 #include "Messages.h"
 #include "MetadataTagIO.h"
 
+#include <Autolock.h>
 #include <Node.h>
 #include <Path.h>
 #include <SupportDefs.h>
@@ -181,6 +182,11 @@ void MediaLibraryScanner::ProcessFile(BEntry &entry) {
   BString mbTrackId, mbAlbumId, mbArtistId;
 
   if (!isMidiFile) {
+    // Serialised against every other user of TagLib in the process: the
+    // library's implicit sharing is not thread-safe, and nine scanner threads
+    // parsing at once corrupted the heap. See MetadataTagIO::TagLibLock().
+    BAutolock tagGuard(MetadataTagIO::TagLibLock());
+
     try {
       TagLib::FileRef f(path.Path());
 
