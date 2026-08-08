@@ -1623,7 +1623,7 @@ void MediaLibraryCache::_HandleNodeMonitor(BMessage *msg, int32 opcode) {
       ino_t node;
       if (msg->FindInt64("node", &node) == B_OK) {
         for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
-          if (it->second.inode == (uint64)node) {
+          if (it->second.inode == node) {
             _RemoveFileFromCache(it->first);
             break;
           }
@@ -1650,7 +1650,7 @@ void MediaLibraryCache::_HandleNodeMonitor(BMessage *msg, int32 opcode) {
         MediaItem item;
         bool found = false;
         for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
-          if (it->second.inode == (uint64)node) {
+          if (it->second.inode == node) {
             oldPath = it->first;
             item = it->second;
             found = true;
@@ -1688,7 +1688,7 @@ void MediaLibraryCache::_HandleNodeMonitor(BMessage *msg, int32 opcode) {
       ino_t node;
       if (msg->FindInt64("node", &node) == B_OK) {
         for (auto it = fEntries.begin(); it != fEntries.end(); ++it) {
-          if (it->second.inode == (uint64)node) {
+          if (it->second.inode == node) {
             _ScanAndAddFile(it->first);
             break;
           }
