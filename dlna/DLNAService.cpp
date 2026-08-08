@@ -1395,7 +1395,7 @@ BPath DLNAService::_CachePath(const BString& uuid) const
 {
     BPath path;
     find_directory(B_USER_SETTINGS_DIRECTORY, &path);
-    path.Append("BeTon");
+    path.Append("Beton");
 
     BDirectory dir(path.Path());
     if (dir.InitCheck() != B_OK)

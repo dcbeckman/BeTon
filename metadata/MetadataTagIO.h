@@ -161,7 +161,7 @@ namespace MetadataTagIO {
 /**
  * @brief The lock every caller must hold while inside TagLib.
  *
- * BeTon links TagLib 1.x, whose ByteVector/String use implicit sharing built
+ * Beton links TagLib 1.x, whose ByteVector/String use implicit sharing built
  * on TagLib::RefCounter. That reference count is not safe against concurrent
  * mutation, and the shared empty/null instances are touched by every parse,
  * so two threads parsing unrelated files still race on the same counter. The

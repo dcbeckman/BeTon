@@ -224,7 +224,7 @@ void PlaylistEditController::RenamePlaylistFromPrompt(BMessage *msg) {
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &dirPath) != B_OK)
     return;
 
-  dirPath.Append("BeTon/Playlists");
+  dirPath.Append("Beton/Playlists");
 
   BString oldFile = oldName;
   oldFile << ".m3u";

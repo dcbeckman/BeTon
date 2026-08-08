@@ -343,7 +343,7 @@ void LibraryController::_ShowCacheDamagedAlert(int32 recovered, int32 declared,
     // recovered, and "1522 of 0 entries" would just be confusing.
     if (declared > recovered) {
       text.SetToFormat(
-          B_TRANSLATE("BeTon's media cache was damaged and could not be read "
+          B_TRANSLATE("Beton's media cache was damaged and could not be read "
                       "in full.\n\n"
                       "%ld of %ld entries were recovered and checked against "
                       "the files on disk. The rest of the library is being "
@@ -351,7 +351,7 @@ void LibraryController::_ShowCacheDamagedAlert(int32 recovered, int32 declared,
           (long)recovered, (long)declared);
     } else {
       text.SetToFormat(
-          B_TRANSLATE("BeTon's media cache was damaged and could not be read "
+          B_TRANSLATE("Beton's media cache was damaged and could not be read "
                       "in full.\n\n"
                       "%ld entries were recovered and checked against the "
                       "files on disk. The rest of the library is being "
@@ -359,7 +359,7 @@ void LibraryController::_ShowCacheDamagedAlert(int32 recovered, int32 declared,
           (long)recovered);
     }
   } else {
-    text = B_TRANSLATE("BeTon's media cache was damaged and could not be "
+    text = B_TRANSLATE("Beton's media cache was damaged and could not be "
                        "read.\n\n"
                        "It has been discarded, and the library is being "
                        "rebuilt by rescanning your music folders and "
@@ -367,7 +367,7 @@ void LibraryController::_ShowCacheDamagedAlert(int32 recovered, int32 declared,
   }
 
   text << "\n\n"
-       << B_TRANSLATE("You can keep using BeTon while this runs.");
+       << B_TRANSLATE("You can keep using Beton while this runs.");
 
   if (!backupPath.IsEmpty()) {
     text << "\n\n"

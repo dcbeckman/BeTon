@@ -12,7 +12,7 @@
  * @brief Manages internet radio stations: loading, saving, importing.
  *
  * Stations are persisted in BMessage format at
- * ~/config/settings/BeTon/radio.settings.
+ * ~/config/settings/Beton/radio.settings.
  *
  * Supports manual station management (add/edit/remove) and
  * import from .m3u and .pls playlist files.

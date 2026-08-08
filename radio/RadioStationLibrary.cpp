@@ -32,7 +32,7 @@ BString RadioStationLibrary::_SettingsPath() const {
   BPath path;
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK)
     return "";
-  path.Append("BeTon/radio.settings");
+  path.Append("Beton/radio.settings");
   return BString(path.Path());
 }
 
@@ -101,7 +101,7 @@ bool RadioStationLibrary::SaveStations() {
   BPath dirPath;
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &dirPath) != B_OK)
     return false;
-  dirPath.Append("BeTon");
+  dirPath.Append("Beton");
   create_directory(dirPath.Path(), 0755);
 
   BMessage archive;

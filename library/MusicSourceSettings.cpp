@@ -136,7 +136,7 @@ void MusicSourceSettings::InitCache() {
     return;
   }
 
-  settingsPath.Append("BeTon/directories.settings");
+  settingsPath.Append("Beton/directories.settings");
 
   BFile file(settingsPath.Path(), B_READ_ONLY);
   if (file.InitCheck() != B_OK) {

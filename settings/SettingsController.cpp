@@ -39,7 +39,7 @@ void SettingsController::SaveSettings() {
 
   BPath settingsPath;
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath) == B_OK) {
-    settingsPath.Append("BeTon/settings");
+    settingsPath.Append("Beton/settings");
     BFile file(settingsPath.Path(),
                B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
     if (file.InitCheck() == B_OK) {
@@ -146,7 +146,7 @@ void SettingsController::LoadSettings() {
 
   BPath settingsPath;
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath) == B_OK) {
-    settingsPath.Append("BeTon/settings");
+    settingsPath.Append("Beton/settings");
     BFile file(settingsPath.Path(), B_READ_ONLY);
     if (file.InitCheck() == B_OK) {
       BMessage state;
@@ -339,7 +339,7 @@ void SettingsController::ApplyLoadedSettings() {
   if (fWindow->fPlaylistPath.IsEmpty()) {
     BPath path;
     if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
-      path.Append("BeTon/Playlists");
+      path.Append("Beton/Playlists");
       fWindow->fPlaylistPath = path.Path();
     }
   }

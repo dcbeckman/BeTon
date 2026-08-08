@@ -292,7 +292,7 @@ MediaLibraryCache::MediaLibraryCache(const BMessenger &target)
     : BLooper("MediaLibraryCache"), fTarget(target) {
   BPath settingsPath;
   find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath);
-  settingsPath.Append("BeTon/media.cache");
+  settingsPath.Append("Beton/media.cache");
   fCachePath = settingsPath.Path();
 }
 
@@ -330,7 +330,7 @@ void MediaLibraryCache::LoadDirectories(std::vector<BString> &outDirs) {
 
   // Try loading from the current settings format first.
   BPath settingsPath = p;
-  settingsPath.Append("BeTon/directories.settings");
+  settingsPath.Append("Beton/directories.settings");
   BFile file(settingsPath.Path(), B_READ_ONLY);
 
   if (file.InitCheck() == B_OK) {
@@ -350,7 +350,7 @@ void MediaLibraryCache::LoadDirectories(std::vector<BString> &outDirs) {
 
   // Load from settings (folder_source)
   BPath mainSettingsPath = p;
-  mainSettingsPath.Append("BeTon/settings");
+  mainSettingsPath.Append("Beton/settings");
   BFile mainFile(mainSettingsPath.Path(), B_READ_ONLY);
   if (mainFile.InitCheck() == B_OK) {
     BMessage mainArchive;
