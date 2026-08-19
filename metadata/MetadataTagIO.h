@@ -2,6 +2,7 @@
 #define BETON_METADATA_TAG_IO_H
 #include "Debug.h"
 
+#include <Locker.h>
 #include <Path.h>
 #include <String.h>
 #include <SupportDefs.h>
@@ -152,9 +153,32 @@ namespace MetadataTagIO {
  * @brief Reads metadata from the specified file.
  * @param path The path to the audio file.
  * @param out Output struct to populate with metadata.
+ * @param bfsFallback If true, empty tag fields fall back to the file's BFS
+ *        attributes. Pass false when the result is written back to disk, or
+ *        the fallback resurrects values the caller meant to clear.
  * @return True on success, false otherwise.
  */
-bool ReadTags(const BPath &path, TagData &out);
+/**
+ * @brief The lock every caller must hold while inside TagLib.
+ *
+ * Beton links TagLib 1.x, whose ByteVector/String use implicit sharing built
+ * on TagLib::RefCounter. That reference count is not safe against concurrent
+ * mutation, and the shared empty/null instances are touched by every parse,
+ * so two threads parsing unrelated files still race on the same counter. The
+ * observed result was a double free inside ID3v2 frame parsing, with the heap
+ * corruption surfacing later as faults in unrelated TagLib code.
+ *
+ * One scanner thread per source directory means that race is otherwise
+ * routine, so every entry into TagLib -- from the scanners, the cache looper
+ * and the window thread alike -- is serialised on this lock. It is recursive,
+ * so nested MetadataTagIO calls are fine.
+ *
+ * Only the tag parsing is serialised: directory walking, stat()ing and the
+ * workload counting pass all still run in parallel.
+ */
+BLocker &TagLibLock();
+
+bool ReadTags(const BPath &path, TagData &out, bool bfsFallback = true);
 
 /**
  * @brief Reads metadata from Haiku BFS attributes.

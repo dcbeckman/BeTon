@@ -3,6 +3,9 @@
 #include "MediaTableView.h"
 #include "DLNAMessageHandler.h"
 #include "DLNAViewController.h"
+#if ENABLE_LOCAL_OUTPUT
+#include "OutputViewController.h"
+#endif
 #include "DLNAService.h"
 #include "Debug.h"
 #include "MusicSourceManagerWindow.h"
@@ -39,6 +42,7 @@
 #include "ViewStateController.h"
 
 #include <AboutWindow.h>
+#include <Alert.h>
 #include <Autolock.h>
 #include <Button.h>
 #include <ColumnTypes.h>
@@ -91,6 +95,7 @@ static constexpr int32 ICON_REPEAT_GREEN = 2011;
 static constexpr int32 ICON_REPEAT_ORANGE = 2012;
 static constexpr int32 ICON_MUTE_ON = 2013;
 static constexpr int32 ICON_MUTE_OFF = 2014;
+static constexpr int32 ICON_OUTPUT_DEVICE = 1005;
 ///@}
 
 bool MainWindow::_HandleViewMessage(BMessage *msg) {
@@ -112,6 +117,44 @@ bool MainWindow::_HandleRadioMessage(BMessage *msg) {
 bool MainWindow::_HandleDlnaMessage(BMessage *msg) {
   return fDlnaCommandHandler && fDlnaCommandHandler->HandleMessage(msg);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+bool MainWindow::_HandleLocalOutputMessage(BMessage *msg) {
+  if (!fLocalOutputController || !msg)
+    return false;
+
+  switch (msg->what) {
+  case MSG_SHOW_LOCAL_OUTPUT_MENU:
+    fLocalOutputController->ShowLocalOutputMenu();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_SELECTED:
+    fLocalOutputController->SelectLocalOutput(msg);
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH:
+    fLocalOutputController->RefreshDevices();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH + 100: // Toggle local output button
+    fLocalOutputController->ToggleLocalOutputButton();
+    return true;
+
+  case MSG_LOCAL_OUTPUT_REFRESH + 101: // Trigger settings save
+    SaveSettings();
+    return true;
+
+  case MSG_CONFLICT_POLICY_CHANGED:
+    fLocalOutputController->SetConflictPolicy(msg);
+    return true;
+
+  case MSG_FALLBACK_DEVICE_CHANGED:
+    fLocalOutputController->SetFallbackDevice(msg);
+    return true;
+  }
+  return false;
+}
+#endif
 
 bool MainWindow::_HandleStatusAndSearchMessage(BMessage *msg) {
   return fStatusBarController && fStatusBarController->HandleMessage(msg);
@@ -402,6 +445,9 @@ MainWindow::MainWindow()
   fRadioStationController = new RadioStationController(this);
   fRadioMessageHandler = new RadioMessageHandler(this);
   fDlnaController = new DLNAViewController(this);
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputController = new OutputViewController(this);
+#endif
   fDlnaCommandHandler = new DLNAMessageHandler(this);
   fSettingsController = new SettingsController(this);
   fStatusBarController = new StatusBarController(this);
@@ -450,8 +496,42 @@ MainWindow::MainWindow()
     fDlnaController->RebuildRendererMenu();
   fLocalServer.Start();
 #endif
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputController) {
+    // _BuildUI() ran before LoadSettings(), so the button was laid out from
+    // the default rather than the saved setting; apply it now that it's known.
+    fLocalOutputController->ApplyButtonVisibility();
+    fLocalOutputController->RebuildOutputMenu();
+  }
+
+  BString breadcrumbPath;
+  BPath bPath;
+  if (find_directory(B_USER_SETTINGS_DIRECTORY, &bPath) == B_OK) {
+    bPath.Append("Beton");
+    bPath.Append("output_breadcrumb");
+    breadcrumbPath = bPath.Path();
+  }
+  if (!breadcrumbPath.IsEmpty() && BEntry(breadcrumbPath.String()).Exists()) {
+    BAlert* alert = new BAlert("Recovery",
+        B_TRANSLATE("Beton exited uncleanly while using direct local audio output. "
+                    "The system mixer output might still be redirected to that device.\n\n"
+                    "Do you want to restore system audio routing to its original settings?"),
+        B_TRANSLATE("No, keep current"),
+        B_TRANSLATE("Yes, restore settings"),
+        nullptr, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+    alert->SetShortcut(0, B_ESCAPE);
+    int32 response = alert->Go();
+    if (response == 1) {
+      AudioOutputManager mgr;
+      mgr.RecoverFromBreadcrumb();
+    } else {
+      unlink(breadcrumbPath.String());
+    }
+  }
+#endif
 
   AddCommonFilter(new WindowClickFilter(this));
+  _InitCDVolumeMonitoring();
 }
 
 /**
@@ -506,6 +586,9 @@ MainWindow::~MainWindow() {
   delete fRadioStationLibrary;
   delete fDlnaCommandHandler;
   delete fDlnaController;
+#if ENABLE_LOCAL_OUTPUT
+  delete fLocalOutputController;
+#endif
   delete fDlnaManager;
   delete fLibraryMessageHandler;
   delete fViewMessageHandler;
@@ -531,6 +614,9 @@ MainWindow::~MainWindow() {
   if (fOutputMenuItem && fOutputMenuItem->Menu() == nullptr)
     delete fOutputMenuItem;
   delete fIconRenderer;
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  delete fIconLocalOutput;
 #endif
 }
 
@@ -609,6 +695,11 @@ void MainWindow::_BuildUI() {
   fSettingsMenu->AddItem(fToggleDlnaItem);
 #if ENABLE_DLNA_OUTPUT
   _SetOutputMenuVisible(fDlnaEnabled);
+#endif
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputSettingsMenu = new BMenu(B_TRANSLATE("Output Device"));
+  fLocalOutputSettingsMenuItem = new BMenuItem(fLocalOutputSettingsMenu);
+  fSettingsMenu->AddItem(fLocalOutputSettingsMenuItem);
 #endif
   fSettingsMenu->AddSeparatorItem();
 
@@ -710,7 +801,7 @@ void MainWindow::_BuildUI() {
 
   fBtnMute = new IconButtonView("mute_icon", fIconMuteOn, new BMessage(MSG_MUTE_TOGGLE));
 #if ENABLE_DLNA_OUTPUT
-  fIconRenderer = LoadIconFromResource(1005, iconSize);
+  fIconRenderer = LoadIconFromResource(ICON_OUTPUT_DEVICE, iconSize);
 #endif
 
   if (fIconPrev)
@@ -769,6 +860,19 @@ void MainWindow::_BuildUI() {
   if (fIconRenderer)
     fBtnRenderer->SetIcon(fIconRenderer, 0);
   fBtnRenderer->SetExplicitSize(buttonSize);
+#endif
+
+#if ENABLE_LOCAL_OUTPUT
+  fLocalOutputMenu = new BPopUpMenu("");
+  fLocalOutputMenu->SetTargetForItems(this);
+
+  fBtnLocalOutput = new BButton("", new BMessage(MSG_SHOW_LOCAL_OUTPUT_MENU));
+  fIconLocalOutput = LoadIconFromResource(ICON_OUTPUT_DEVICE, iconSize);
+  if (fIconLocalOutput)
+    fBtnLocalOutput->SetIcon(fIconLocalOutput, 0);
+  fBtnLocalOutput->SetExplicitSize(buttonSize);
+  // Visibility is applied from the saved setting after LoadSettings(), which
+  // runs later than this; see OutputViewController::ApplyButtonVisibility().
 #endif
 
   BScrollView *playlistScroll = new BScrollView(
@@ -831,6 +935,10 @@ void MainWindow::_BuildUI() {
       .AddStrut(kItemSpacing)
       .Add(fBtnRenderer)
 #endif
+#if ENABLE_LOCAL_OUTPUT
+      .AddStrut(kItemSpacing)
+      .Add(fBtnLocalOutput)
+#endif
       .AddStrut(kItemSpacing)
       .Add(fDlnaServerField)
       .AddGlue()
@@ -861,6 +969,12 @@ void MainWindow::WindowActivated(bool active) {
     if (fLibraryManager && fLibraryManager->ContentView()) {
       fLibraryManager->ContentView()->CommitCellEdit();
     }
+  } else {
+#if ENABLE_LOCAL_OUTPUT
+    if (fLocalOutputController) {
+      fLocalOutputController->RebuildOutputMenu();
+    }
+#endif
   }
 }
 
@@ -877,6 +991,16 @@ void MainWindow::WindowActivated(bool active) {
  * @param msg The received message.
  */
 void MainWindow::MessageReceived(BMessage *msg) {
+  if (msg->what == B_NODE_MONITOR) {
+    int32 opcode = 0;
+    if (msg->FindInt32("opcode", &opcode) == B_OK) {
+      if (opcode == B_DEVICE_MOUNTED || opcode == B_DEVICE_UNMOUNTED) {
+        _CheckMountedCDs();
+        return;
+      }
+    }
+  }
+
   if (_HandleViewMessage(msg))
     return;
   if (_HandlePlaybackMessage(msg))
@@ -890,6 +1014,11 @@ void MainWindow::MessageReceived(BMessage *msg) {
 
   if (_HandleDlnaMessage(msg))
     return;
+
+#if ENABLE_LOCAL_OUTPUT
+  if (_HandleLocalOutputMessage(msg))
+    return;
+#endif
 
   if (_HandleStatusAndSearchMessage(msg))
     return;
@@ -970,9 +1099,12 @@ status_t MainWindow::_ThreadEntry(void *data) {
 void MainWindow::UpdateFilteredViews(bool preserveScroll) {
   if (fLibraryManager) {
     const auto &items =
-        (fIsRadioMode || fIsDlnaMode) ? fRadioItems : fAllItems;
+        (fIsRadioMode || fIsDlnaMode) ? fRadioItems :
+        (fIsCDMode) ? fLibraryManager->ActiveItems() : fAllItems;
     BString context = "Library";
-    if (fIsRadioMode)
+    if (fIsCDMode)
+      context = "CD";
+    else if (fIsRadioMode)
       context = "Radio";
     else if (fIsDlnaMode)
       context = "DLNA";
@@ -984,7 +1116,7 @@ void MainWindow::UpdateFilteredViews(bool preserveScroll) {
     fLibraryManager->UpdateFilteredViews(
         items, fIsLibraryMode || fIsRadioMode || fIsDlnaMode,
         context,
-        fSearchField->Text(), preserveScroll, true, IsPlaylistSelected());
+        fSearchField->Text(), preserveScroll, true, IsPlaylistSelected() || fIsCDMode);
     if (!fIsRadioMode && !fIsDlnaMode) {
       if (fStatusBarController)
         fStatusBarController->UpdateLibraryStatus();
@@ -1284,5 +1416,116 @@ void MainWindow::ApplyColors() {
 
   if (fPlaylistLibrary && fPlaylistLibrary->View()) {
     fPlaylistLibrary->View()->SetSelectionColor(selColor);
+  }
+}
+
+void MainWindow::_InitCDVolumeMonitoring() {
+  fVolumeRoster.StartWatching(BMessenger(this));
+  _CheckMountedCDs();
+}
+
+void MainWindow::_CheckMountedCDs() {
+  BVolumeRoster roster;
+  BVolume vol;
+  roster.Rewind();
+
+  std::vector<CDItemInfo> mountedCDs;
+
+  while (roster.GetNextVolume(&vol) == B_OK) {
+    fs_info info;
+    if (fs_stat_dev(vol.Device(), &info) == B_OK && strcmp(info.fsh_name, "cdda") == 0) {
+      BDirectory rootDir;
+      if (vol.GetRootDirectory(&rootDir) == B_OK) {
+        BEntry rootEntry;
+        rootDir.GetEntry(&rootEntry);
+        BPath rootPath;
+        if (rootEntry.GetPath(&rootPath) == B_OK) {
+          BString cdPath = rootPath.Path();
+          BNode node(&rootEntry);
+
+          char buf[256];
+          BString artist;
+          BString album;
+
+          memset(buf, 0, sizeof(buf));
+          if (node.ReadAttr("Audio:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+          else if (node.ReadAttr("Media:Artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+          else if (node.ReadAttr("cdda/artist", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            artist = buf;
+
+          memset(buf, 0, sizeof(buf));
+          if (node.ReadAttr("Audio:Album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+          else if (node.ReadAttr("Media:Title", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+          else if (node.ReadAttr("cdda/album", B_STRING_TYPE, 0, buf, sizeof(buf) - 1) > 0)
+            album = buf;
+
+          artist.Trim();
+          album.Trim();
+
+          char volName[B_FILE_NAME_LENGTH];
+          memset(volName, 0, sizeof(volName));
+          vol.GetName(volName);
+
+          BString label;
+          if (!artist.IsEmpty() && !album.IsEmpty()) {
+            label << artist << " - " << album;
+          } else if (!artist.IsEmpty()) {
+            label << artist << " - Audio CD";
+          } else if (!album.IsEmpty()) {
+            label = album;
+          } else if (volName[0] != '\0' && strcmp(volName, "Audio CD") != 0) {
+            label = volName;
+          } else {
+            label = "Audio CD";
+          }
+
+          int count = 1;
+          for (const auto &existing : mountedCDs) {
+            BString prefix = label;
+            prefix << " (";
+            if (existing.label == label || existing.label.StartsWith(prefix)) {
+              count++;
+            }
+          }
+          if (count > 1) {
+            label << " (" << count << ")";
+          }
+
+          mountedCDs.push_back({label, cdPath});
+        }
+      }
+    }
+  }
+
+  if (fPlaylistLibrary && fPlaylistLibrary->View()) {
+    fPlaylistLibrary->View()->SyncCDItems(mountedCDs);
+  }
+
+  if (!mountedCDs.empty()) {
+    // Keep pointing at the disc the user is actually on. A rescan is triggered
+    // by any mount/unmount, so blindly taking mountedCDs[0] here would drag a
+    // second-drive selection back to the first drive.
+    bool currentStillMounted = false;
+    for (const auto &cd : mountedCDs) {
+      if (cd.path == fCDPath) {
+        currentStillMounted = true;
+        break;
+      }
+    }
+    if (!currentStillMounted)
+      fCDPath = mountedCDs[0].path;
+  } else {
+    if (!fCDPath.IsEmpty()) {
+      if (fIsCDMode) {
+        if (fPlaylistLibrary && fPlaylistLibrary->View()) {
+          fPlaylistLibrary->View()->SelectByName("Library");
+        }
+      }
+      fCDPath.Truncate(0);
+    }
   }
 }

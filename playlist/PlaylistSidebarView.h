@@ -12,7 +12,7 @@
 class PlaylistLibrary;
 
 // Logical source types shown in the playlist sidebar.
-enum class PlaylistItemKind { Library, Playlist, Folder, Radio, DLNA };
+enum class PlaylistItemKind { Library, CD, Playlist, Folder, Radio, DLNA };
 
 struct PlaylistRow {
   /** @name Data */
@@ -21,6 +21,11 @@ struct PlaylistRow {
   bool writable;
   PlaylistItemKind kind;
   ///@}
+};
+
+struct CDItemInfo {
+  BString label;
+  BString path;
 };
 
 class PlaylistSidebarView : public SingleColumnListView {
@@ -49,6 +54,10 @@ public:
   void SetIsUnwritableByName(const BString &name, bool v);
   bool RemovePlaylistAt(int32 index);
 
+  void SyncCDItems(const std::vector<CDItemInfo> &cds);
+  int32 SetCDItem(const char *title, const char *path);
+  void RemoveCDItem();
+
   int32 AddItem(const char *title, bool writable);
   int32 AddItem(const char *title, bool writable, PlaylistItemKind kind);
   int32 AddItem(const char *title, const char *path, bool writable = true,
@@ -67,7 +76,9 @@ private:
   void SetHoverIndex(int32 idx);
 
   void _EnsureIconsLoaded() const;
-  BBitmap *_IconFor(PlaylistItemKind kind) const;
+  BBitmap *_IconFor(PlaylistItemKind kind, const BString &path) const;
+  BBitmap *_CdIconFor(const BString &path) const;
+  void _PruneCdIcons(const std::vector<CDItemInfo> &mountedCDs);
 
   int32 _FirstPlaylistIndex() const;
   void _ReorderItem(int32 from, int32 to);
@@ -85,7 +96,16 @@ private:
   BPoint fDragStartPoint;
   bool fIsDragging{false};
 
+  /// Per-disc volume icon, keyed by mount path. A null bitmap means the disc
+  /// has no icon of its own and the generic fIconCd should be drawn instead.
+  struct CdIconEntry {
+    BString path;
+    BBitmap *icon;
+  };
+  mutable std::vector<CdIconEntry> fIconCdByPath;
+
   mutable BBitmap *fIconLibrary = nullptr;
+  mutable BBitmap *fIconCd = nullptr;
   mutable BBitmap *fIconPlaylist = nullptr;
   mutable BBitmap *fIconFolder = nullptr;
   mutable BBitmap *fIconRadio = nullptr;

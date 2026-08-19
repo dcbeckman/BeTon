@@ -1,10 +1,12 @@
 #include "ArtworkView.h"
+#include "Messages.h"
 #include <algorithm>
 #include <Bitmap.h>
 #include <Catalog.h>
 #include <cmath>
 #include <Message.h>
 #include <View.h>
+#include <Window.h>
 
 #undef B_TRANSLATION_CONTEXT
 #define B_TRANSLATION_CONTEXT "ArtworkView"
@@ -163,6 +165,23 @@ void ArtworkView::Draw(BRect updateRect) {
     DrawBitmapAsync(fBitmap, fBitmap->Bounds(), frame, B_FILTER_BITMAP_BILINEAR);
   }
   SetDrawingMode(B_OP_COPY);
+}
+
+void ArtworkView::MouseDown(BPoint where) {
+  int32 buttons = B_PRIMARY_MOUSE_BUTTON;
+  if (Window() && Window()->CurrentMessage())
+    Window()->CurrentMessage()->FindInt32("buttons", &buttons);
+
+  if ((buttons & B_SECONDARY_MOUSE_BUTTON) != 0) {
+    BPoint screenPoint = ConvertToScreen(where);
+    BMessage msg(MSG_SHOW_COVER_CONTEXT_MENU);
+    msg.AddPoint("where", screenPoint);
+    if (Window())
+      Window()->PostMessage(&msg);
+    return;
+  }
+
+  BView::MouseDown(where);
 }
 
 void ArtworkView::MessageReceived(BMessage *msg) {

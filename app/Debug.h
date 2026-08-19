@@ -18,6 +18,7 @@ extern bool gIsDebug;
   do {                                                                         \
     if (gIsDebug) {                                                            \
       printf("[%s:%d] " fmt, __FILE__, __LINE__, ##__VA_ARGS__);               \
+      fflush(stdout);                                                          \
     }                                                                          \
   } while (0)
 

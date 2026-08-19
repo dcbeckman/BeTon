@@ -64,7 +64,7 @@ LoadPropertiesFrame(float width, float height)
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath) != B_OK)
     return frame;
 
-  settingsPath.Append("BeTon/properties_window.settings");
+  settingsPath.Append("Beton/properties_window.settings");
   BFile file(settingsPath.Path(), B_READ_ONLY);
   if (file.InitCheck() != B_OK)
     return frame;
@@ -1716,7 +1716,7 @@ void MetadataPropertiesWindow::_SaveWindowFrame() const {
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsDir) != B_OK)
     return;
 
-  settingsDir.Append("BeTon");
+  settingsDir.Append("Beton");
   create_directory(settingsDir.Path(), 0755);
 
   BPath settingsPath(settingsDir);

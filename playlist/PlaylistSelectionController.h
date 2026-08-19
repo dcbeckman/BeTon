@@ -24,6 +24,7 @@ private:
   void ShowLibraryPlaylistSource();
   void ShowRegularPlaylistSource(const BString &name);
   void ShowFolderPlaylistSource(const BString &name);
+  void ShowCDPlaylistSource(const BString &name);
 
   MainWindow *fWindow;
 };

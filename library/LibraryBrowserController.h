@@ -48,6 +48,7 @@ public:
   SingleColumnListView *AlbumView() const;
   /** @brief Returns the main media content table view. */
   MediaTableView *ContentView() const;
+  const std::vector<MediaItem> &ActiveItems() const { return fActiveItems; }
 
   /**
    * @brief Updates the filtered views based on the full database and current
@@ -115,6 +116,11 @@ public:
    * @param items Allowed media items.
    */
   void SetActiveItems(const std::vector<MediaItem> &items);
+  /**
+   * @brief Sets active folder path scope for folder-like filtering.
+   * @param folderPath Active folder path.
+   */
+  void SetActiveFolderPath(const BString &folderPath);
 
   /**
    * @brief Replaces a path in the active scope after a file was moved.
@@ -157,6 +163,7 @@ private:
 
   std::vector<BString> fActivePaths;
   std::vector<MediaItem> fActiveItems;
+  BString fActiveFolderPath;
 
   /// Cache last selection to avoid resetting downstream columns unnecessarily
   BString fLastSelectedGenre;

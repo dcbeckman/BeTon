@@ -186,7 +186,7 @@ void MusicSourceManagerWindow::SaveSettings() {
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath) != B_OK)
     return;
 
-  settingsPath.Append("BeTon");
+  settingsPath.Append("Beton");
   create_directory(settingsPath.Path(), 0755);
   settingsPath.Append("directories.settings");
 
@@ -211,7 +211,7 @@ void MusicSourceManagerWindow::LoadSettings() {
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsPath) != B_OK)
     return;
 
-  settingsPath.Append("BeTon/directories.settings");
+  settingsPath.Append("Beton/directories.settings");
   BFile file(settingsPath.Path(), B_READ_ONLY);
 
   if (file.InitCheck() == B_OK) {
@@ -238,7 +238,7 @@ void MusicSourceManagerWindow::MigrateFromOldFormat() {
   if (find_directory(B_USER_SETTINGS_DIRECTORY, &oldPath) != B_OK)
     return;
 
-  oldPath.Append("BeTon/directories.txt");
+  oldPath.Append("Beton/directories.txt");
   BFile oldFile(oldPath.Path(), B_READ_ONLY);
   if (oldFile.InitCheck() != B_OK)
     return;

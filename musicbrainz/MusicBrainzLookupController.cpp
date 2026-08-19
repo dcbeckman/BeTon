@@ -889,10 +889,17 @@ void MusicBrainzLookupController::FetchCover(BMessage *msg) {
   BMessenger replyTo;
   if (msg->FindMessenger("original_reply_to", &replyTo) != B_OK)
     replyTo = msg->ReturnAddress();
+  if (!replyTo.IsValid())
+    replyTo = BMessenger(fWindow);
+
+  BString artistMsg, titleMsg, albumMsg;
+  msg->FindString("artist", &artistMsg);
+  msg->FindString("title", &titleMsg);
+  msg->FindString("album", &albumMsg);
 
   MainWindow *window = fWindow;
   int32 gen = window->fMbSearchGeneration.load(std::memory_order_acquire);
-  window->LaunchThread("CoverFetchMB", [window, path, replyTo, gen]() {
+  window->LaunchThread("CoverFetchMB", [window, path, artistMsg, titleMsg, albumMsg, replyTo, gen]() {
     DEBUG_PRINT("MB Thread started for %s (Gen=%ld)\n",
                 path.String(), (long)gen);
     if (!window->fMbClient) {
@@ -917,8 +924,16 @@ void MusicBrainzLookupController::FetchCover(BMessage *msg) {
     };
 
     TagData td;
-    if (!MetadataTagIO::ReadTags(BPath(path.String()), td)) {
-      DEBUG_PRINT("Could not read tags from %s\n", path.String());
+    MetadataTagIO::ReadTags(BPath(path.String()), td);
+    if (td.artist.IsEmpty() && !artistMsg.IsEmpty())
+      td.artist = artistMsg;
+    if (td.title.IsEmpty() && !titleMsg.IsEmpty())
+      td.title = titleMsg;
+    if (td.album.IsEmpty() && !albumMsg.IsEmpty())
+      td.album = albumMsg;
+
+    if (td.artist.IsEmpty() && td.title.IsEmpty() && td.album.IsEmpty()) {
+      DEBUG_PRINT("Could not read tags or metadata for %s\n", path.String());
       sendNoCoverReply();
       return;
     }
@@ -978,6 +993,7 @@ void MusicBrainzLookupController::FetchCover(BMessage *msg) {
       DEBUG_PRINT("FetchCover success! %zu bytes, mime=%s\n",
                   data.size(), mime.String());
       BMessage reply(MSG_PROP_SET_COVER_DATA);
+      reply.AddString("file", path);
       reply.AddData("bytes", B_RAW_TYPE, data.data(), data.size());
       if (!mime.IsEmpty())
         reply.AddString("mime", mime.String());
@@ -1005,6 +1021,7 @@ void MusicBrainzLookupController::FetchCover(BMessage *msg) {
                       "mime=%s\n",
                       data.size(), mime.String());
           BMessage reply(MSG_PROP_SET_COVER_DATA);
+          reply.AddString("file", path);
           reply.AddData("bytes", B_RAW_TYPE, data.data(), data.size());
           if (!mime.IsEmpty())
             reply.AddString("mime", mime.String());
