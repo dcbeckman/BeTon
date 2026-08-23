@@ -28,6 +28,10 @@
 #include <StringView.h>
 #include <TextControl.h>
 #include <Window.h>
+#include <VolumeRoster.h>
+#include <Volume.h>
+#include <NodeMonitor.h>
+#include <fs_info.h>
 #include "IconButtonView.h"
 #include <atomic>
 #include <functional>
@@ -41,6 +45,7 @@ class BGroupView;
 class ArtworkController;
 class DLNAMessageHandler;
 class DLNAViewController;
+class OutputViewController;
 class LibraryMessageHandler;
 class LibraryController;
 class MetadataMessageHandler;
@@ -104,13 +109,14 @@ public:
   void UpdateFilteredViews(bool preserveScroll = false);
   void UpdateFileInfo();
   void UpdateStatus(const BString &text, bool isPermanent = false);
-  /// True only for user playlists (not Library/Radio/DLNA sources).
+  /// True only for user playlists (not Library/Radio/DLNA/CD sources).
   bool IsPlaylistSelected() const {
-    return !fIsLibraryMode && !fIsFolderMode && !fIsRadioMode && !fIsDlnaMode;
+    return !fIsLibraryMode && !fIsFolderMode && !fIsRadioMode && !fIsDlnaMode && !fIsCDMode;
   }
   bool IsFolderMode() const { return fIsFolderMode; }
   bool IsRadioMode() const { return fIsRadioMode; }
   bool IsDlnaMode() const { return fIsDlnaMode; }
+  bool IsCDMode() const { return fIsCDMode; }
 
   ///@}
 
@@ -133,6 +139,7 @@ private:
   friend class ArtworkController;
   friend class DLNAMessageHandler;
   friend class DLNAViewController;
+  friend class OutputViewController;
   friend class LibraryMessageHandler;
   friend class LibraryController;
   friend class MetadataMessageHandler;
@@ -161,6 +168,9 @@ private:
   bool _HandlePlaylistMessage(BMessage* msg);
   bool _HandleRadioMessage(BMessage* msg);
   bool _HandleDlnaMessage(BMessage* msg);
+#if ENABLE_LOCAL_OUTPUT
+  bool _HandleLocalOutputMessage(BMessage* msg);
+#endif
   bool _HandleStatusAndSearchMessage(BMessage* msg);
   bool _HandleSyncMessage(BMessage* msg);
   bool _HandleMetadataMessage(BMessage* msg);
@@ -174,6 +184,8 @@ private:
 #if ENABLE_DLNA_OUTPUT
   void _SetOutputMenuVisible(bool visible);
 #endif
+  void _InitCDVolumeMonitoring();
+  void _CheckMountedCDs();
 
 
   /** @name Data & State */
@@ -184,6 +196,9 @@ private:
   bool fIsFolderMode = false; ///< True = live folder source view
   bool fIsRadioMode = false;  ///< True = Radio station view
   bool fIsDlnaMode = false;   ///< True = DLNA server browsing view
+  bool fIsCDMode = false;     ///< True = Audio CD source view
+  BString fCDPath;
+  BVolumeRoster fVolumeRoster;
   BString fPlaylistPath;
   BString fCurrentPlaylistName;
 
@@ -249,6 +264,13 @@ private:
   BButton *fBtnRenderer{nullptr};
   BPopUpMenu *fRendererMenu{nullptr};
 #endif
+#if ENABLE_LOCAL_OUTPUT
+  BButton *fBtnLocalOutput{nullptr};
+  BPopUpMenu *fLocalOutputMenu{nullptr};
+  BMenu *fLocalOutputSettingsMenu{nullptr};
+  BMenuItem *fLocalOutputSettingsMenuItem{nullptr};
+  bool fShowLocalOutputBtn{true};
+#endif
   BMenuField *fDlnaServerField{nullptr};
   BPopUpMenu *fDlnaServerMenu{nullptr};
 
@@ -310,6 +332,9 @@ private:
 #if ENABLE_DLNA_OUTPUT
   BBitmap *fIconRenderer{nullptr};
 #endif
+#if ENABLE_LOCAL_OUTPUT
+  BBitmap *fIconLocalOutput{nullptr};
+#endif
 
   ///@}
 
@@ -362,6 +387,9 @@ private:
   DLNAService *fDlnaManager;
   DLNAMessageHandler *fDlnaCommandHandler{nullptr};
   DLNAViewController *fDlnaController{nullptr};
+#if ENABLE_LOCAL_OUTPUT
+  OutputViewController *fLocalOutputController{nullptr};
+#endif
   ViewMessageHandler *fViewMessageHandler{nullptr};
   ViewStateController *fViewStateController{nullptr};
   LocalFileHttpServer fLocalServer;
@@ -371,6 +399,10 @@ private:
   static const uint32 MSG_TOGGLE_RADIO = 'tgRd';
   static const uint32 MSG_TOGGLE_DLNA = 'tgDl';
   static const uint32 MSG_TOGGLE_RENDERER_BTN = 'tgRB';
+#if ENABLE_LOCAL_OUTPUT
+  static const uint32 MSG_SHOW_LOCAL_OUTPUT_MENU = 'shLO';
+  static const uint32 MSG_TOGGLE_LOCAL_OUTPUT_BTN = 'tgLO';
+#endif
   ///@}
 
   /** @name Message Runners (Timers) */

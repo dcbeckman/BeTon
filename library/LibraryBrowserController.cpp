@@ -158,6 +158,7 @@ const std::vector<BString> &LibraryBrowserController::ActivePaths() const {
 void LibraryBrowserController::SetActivePaths(const std::vector<BString> &paths) {
   fActivePaths = paths;
   fActiveItems.clear(); ///< Paths take precedence, clear objects
+  fActiveFolderPath.Truncate(0);
 }
 
 /**
@@ -166,10 +167,17 @@ void LibraryBrowserController::SetActivePaths(const std::vector<BString> &paths)
 void LibraryBrowserController::SetActiveItems(const std::vector<MediaItem> &items) {
   fActiveItems = items;
   fActivePaths.clear();
+  fActiveFolderPath.Truncate(0);
   /// Sync paths for IsPathAllowed compatibility
   fActivePaths.reserve(items.size());
   for (const auto &it : items)
     fActivePaths.push_back(it.path);
+}
+
+void LibraryBrowserController::SetActiveFolderPath(const BString &folderPath) {
+  fActiveFolderPath = folderPath;
+  fActivePaths.clear();
+  fActiveItems.clear();
 }
 
 void LibraryBrowserController::RenameActivePath(const BString &from,
@@ -241,6 +249,15 @@ bool LibraryBrowserController::_PathAllowedByMode(
     const std::vector<BString> &activePaths) const {
   if (isLibraryMode)
     return true;
+
+  if (!fActiveFolderPath.IsEmpty()) {
+    if (filePath == fActiveFolderPath)
+      return true;
+    BString prefix = fActiveFolderPath;
+    if (!prefix.EndsWith("/"))
+      prefix << "/";
+    return filePath.StartsWith(prefix);
+  }
 
   for (const auto &p : activePaths) {
     if (p == filePath)
@@ -361,7 +378,16 @@ void LibraryBrowserController::UpdateFilteredViews(
   std::vector<MediaItem> playlistItems;
 
   if (!isLibraryMode) {
-    if (!fActiveItems.empty()) {
+    if (!fActiveFolderPath.IsEmpty()) {
+      BString folderPrefix = fActiveFolderPath;
+      if (!folderPrefix.EndsWith("/"))
+        folderPrefix << "/";
+      for (const auto &item : allItems) {
+        if (item.path == fActiveFolderPath || item.path.StartsWith(folderPrefix)) {
+          playlistItems.push_back(item);
+        }
+      }
+    } else if (!fActiveItems.empty()) {
       playlistItems = fActiveItems;
     } else {
       /// Fallback: Build items from paths (e.g. from a loaded .m3u)

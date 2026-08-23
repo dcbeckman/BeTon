@@ -6,7 +6,9 @@
 #define MSG_START_SCAN 'msta'       ///< Start the directory scan.
 #define MSG_SCAN_DONE 'mdon'        ///< Scanning is complete.
 #define MSG_SCAN_FINISHED 'scfd'    ///< Final cleanup after scan.
-#define MSG_SCAN_PROGRESS 'mprg'    ///< Periodic progress update from scanner.
+#define MSG_SCAN_PROGRESS 'mprg'    ///< Progress update (scanner->cache, cache->UI).
+#define MSG_SCAN_TOTALS 'mtot'      ///< Scanner reports its counted workload to the cache.
+#define MSG_SCAN_TICK 'mtck'        ///< UI timer: repaint scan status between updates.
 #define MSG_MEDIA_ITEM_FOUND 'mitm' ///< (Legacy) Single item found.
 #define MSG_MEDIA_BATCH 'mbat'      ///< Batch of items from scanner to cache.
 #define MSG_MEDIA_ITEM_REMOVED 'mirm' ///< Item removed from library.
@@ -24,6 +26,12 @@
 #define MSG_DIR_EDIT 'dedt'           ///< Edit directory sync settings.
 #define MSG_DIR_OK 'doky'             ///< Directory settings confirm.
 #define MSG_ATTR_POLL 'apol' ///< Periodic poll for BFS attribute changes.
+#define MSG_WATCH_FOLDER 'wtch'       ///< Watch directory node for live folder updates.
+#define MSG_CACHE_FLUSH 'cfls'        ///< Throttled cache write-back tick.
+#define MSG_CACHE_CORRUPT 'ccrp'      ///< Cache file was unreadable and has been discarded.
+#define MSG_CACHE_EMPTY 'cmty'        ///< Cache loaded fine but holds no entries.
+#define MSG_SCAN_FILES 'scfl'         ///< Queue individual file paths for (re)caching.
+#define MSG_SCAN_FILES_STEP 'scfs'    ///< Internal: process the next chunk of queued files.
 ///@}
 
 /** @name Playback Control */
@@ -109,6 +117,7 @@
 #define MSG_MOVE_TO_TRASH 'mvtr'            ///< Move selection to Trash and remove from playlist.
 #define MSG_MOVE_TO 'mvto'                  ///< Prompt directory to move selected files to.
 #define MSG_MOVE_TO_FOLDER_SELECTED 'mtfs'  ///< Folder picked for Move To.
+#define MSG_FOLDER_ROW_RESTORE 'frrs'       ///< Undo: reinsert a moved/trashed folder row from saved data.
 #define MSG_RESTORE_PLAYLIST_PATHS 'rplp'    ///< Revert/restore playlist tracks.
 #define MSG_CREATE_PLAYLIST_WITH_PATHS 'cplp' ///< Create playlist and populate paths.
 #define MSG_DELETE_PLAYLIST_BY_NAME 'dpln'    ///< Delete playlist by name.
@@ -148,6 +157,8 @@
 #define MSG_COVER_CLEAR_ALBUM 'cvca'       ///< Clear cover for album.
 #define MSG_COVER_DROPPED_APPLY_ALL 'cvda' ///< dropped cover -> all files.
 #define MSG_COVER_BITMAP_READY 'cvbr'      ///< Cover bitmap loaded & ready.
+#define MSG_SHOW_COVER_CONTEXT_MENU 'sccm' ///< Show cover context menu on main screen.
+#define MSG_MAIN_COVER_LOAD_REF 'mclr'     ///< Main window cover file chosen from panel.
 ///@}
 
 /** @name Matching Window */
@@ -206,6 +217,10 @@
 #define MSG_DLNA_REFRESH_CACHE   'dlrc'  ///< Invalidate and rebuild server cache.
 #define MSG_DLNA_RESOURCE_UNAVAILABLE 'dlru' ///< DLNA resource cannot be played.
 #define MSG_MUTE_TOGGLE          'mute'  ///< Toggle audio mute.
+#define MSG_LOCAL_OUTPUT_SELECTED 'lcos' ///< User selected local output target/bus.
+#define MSG_LOCAL_OUTPUT_REFRESH 'lcor'  ///< Refresh local output devices.
+#define MSG_CONFLICT_POLICY_CHANGED 'cplc' ///< On System Mixer Conflict policy changed.
+#define MSG_FALLBACK_DEVICE_CHANGED 'fbdc' ///< Fallback device for conflict changed.
 ///@}
 
 #endif // BETON_MESSAGES_H

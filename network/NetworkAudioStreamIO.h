@@ -54,6 +54,7 @@ public:
      * @brief Stops active streaming session and joins worker thread.
      */
     void     Stop();
+    void     SetTargetFormat(float sampleRate, int32 channels);
 
     /**
      * @brief Requests a seek to absolute media time.
@@ -167,6 +168,8 @@ private:
     std::atomic<bigtime_t>  fFfmpegReadDeadline;
     std::atomic<bigtime_t>  fPendingSeekTime;
     std::vector<HlsTimedMetadataEvent> fPendingHlsMetadata;
+    float                   fTargetSampleRate;
+    int32                   fTargetChannels;
     ///@}
 };
 

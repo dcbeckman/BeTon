@@ -16,10 +16,17 @@
 #include <Resources.h>
 #include <String.h>
 #include <TextControl.h>
+#include <MimeType.h>
+#include <Node.h>
+#include <NodeInfo.h>
+#include <VolumeRoster.h>
+#include <Volume.h>
+#include <fs_info.h>
 #include <algorithm>
 #include <cinttypes>
 #include <map>
 #include <stdio.h>
+#include <string.h>
 
 #undef B_TRANSLATION_CONTEXT
 #define B_TRANSLATION_CONTEXT "PlaylistSidebarView"
@@ -29,6 +36,53 @@ static constexpr int32 ICON_PL_ID = 1002;
 static constexpr int32 ICON_RADIO_ID = 1003;
 static constexpr int32 ICON_DLNA_ID = 1004;
 static constexpr int32 ICON_FOLDER_ID = 1006;
+static constexpr int32 ICON_CD_ID = 1007;
+
+/*!	Icon of the volume mounted at \a cdPath, or NULL if it has none.
+
+	Deliberately scoped to the one disc: with several drives mounted, falling
+	back to "any cdda volume" would hand every sidebar row the same icon.
+*/
+static BBitmap *LoadSystemCDIcon(float size, const char *cdPath) {
+  BVolume vol;
+  bool found = false;
+
+  if (cdPath && cdPath[0] != '\0') {
+    BEntry entry(cdPath);
+    entry_ref ref;
+    if (entry.GetRef(&ref) == B_OK) {
+      vol.SetTo(ref.device);
+      if (vol.InitCheck() == B_OK) {
+        found = true;
+      }
+    }
+  }
+
+  if (found) {
+    uint8 *data = nullptr;
+    size_t len = 0;
+    type_code type = 0;
+    if (vol.GetIcon(&data, &len, &type) == B_OK && data != nullptr && len > 0) {
+      BRect r(0, 0, size - 1, size - 1);
+      auto *bmp = new BBitmap(r, 0, B_RGBA32);
+      if (BIconUtils::GetVectorIcon(data, len, bmp) == B_OK) {
+        delete[] data;
+        return bmp;
+      }
+      delete[] data;
+      delete bmp;
+    }
+
+    BRect r(0, 0, size - 1, size - 1);
+    auto *bmp = new BBitmap(r, 0, B_RGBA32);
+    if (vol.GetIcon(bmp, B_MINI_ICON) == B_OK) {
+      return bmp;
+    }
+    delete bmp;
+  }
+
+  return nullptr;
+}
 
 static BBitmap *LoadVectorIconFromResourceID(int32 id, float size) {
   if (!be_app || !be_app->AppResources())
@@ -75,7 +129,11 @@ PlaylistSidebarView::PlaylistSidebarView(const char *name, BMessenger target, Pl
   fContextMenu->SetTargetForItems(this);
 }
 
-PlaylistSidebarView::~PlaylistSidebarView() { delete fContextMenu; }
+PlaylistSidebarView::~PlaylistSidebarView() {
+  delete fContextMenu;
+  for (auto &entry : fIconCdByPath)
+    delete entry.icon;
+}
 
 void PlaylistSidebarView::SelectionChanged(int32 index) {
   if (index >= 0) {
@@ -448,6 +506,12 @@ void PlaylistSidebarView::_EnsureIconsLoaded() const {
     fIconSize = rowH * 0.7f;
     fIconLibrary = LoadVectorIconFromResourceID(ICON_LIB_ID, fIconSize);
   }
+  // Generic fallback only - a mounted disc's own icon comes from _CdIconFor().
+  if (!fIconCd) {
+    fIconCd = LoadVectorIconFromResourceID(ICON_CD_ID, fIconSize);
+    if (!fIconCd)
+      fIconCd = fIconLibrary;
+  }
   if (!fIconPlaylist)
     fIconPlaylist = LoadVectorIconFromResourceID(ICON_PL_ID, fIconSize);
   if (!fIconFolder) {
@@ -467,11 +531,46 @@ void PlaylistSidebarView::_EnsureIconsLoaded() const {
   }
 }
 
-BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind) const {
+BBitmap *PlaylistSidebarView::_CdIconFor(const BString &path) const {
+  if (path.IsEmpty())
+    return fIconCd;
+
+  for (const auto &entry : fIconCdByPath) {
+    if (entry.path == path)
+      return entry.icon ? entry.icon : fIconCd;
+  }
+
+  // First time we've drawn this disc: ask its volume for an icon. A null
+  // result is cached too, so a disc without one doesn't re-query every frame.
+  BBitmap *icon = LoadSystemCDIcon(fIconSize, path.String());
+  fIconCdByPath.push_back(CdIconEntry{path, icon});
+  return icon ? icon : fIconCd;
+}
+
+void PlaylistSidebarView::_PruneCdIcons(const std::vector<CDItemInfo> &mountedCDs) {
+  for (size_t i = fIconCdByPath.size(); i-- > 0;) {
+    bool stillMounted = false;
+    for (const auto &cd : mountedCDs) {
+      if (cd.path == fIconCdByPath[i].path) {
+        stillMounted = true;
+        break;
+      }
+    }
+    if (!stillMounted) {
+      delete fIconCdByPath[i].icon;
+      fIconCdByPath.erase(fIconCdByPath.begin() + i);
+    }
+  }
+}
+
+BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind,
+                                       const BString &path) const {
   _EnsureIconsLoaded();
   switch (kind) {
   case PlaylistItemKind::Library:
     return fIconLibrary;
+  case PlaylistItemKind::CD:
+    return _CdIconFor(path);
   case PlaylistItemKind::Playlist:
     return fIconPlaylist;
   case PlaylistItemKind::Folder:
@@ -482,6 +581,88 @@ BBitmap *PlaylistSidebarView::_IconFor(PlaylistItemKind kind) const {
     return fIconDlna;
   }
   return nullptr;
+}
+
+void PlaylistSidebarView::SyncCDItems(const std::vector<CDItemInfo> &mountedCDs) {
+  // Each disc gets its own icon, resolved lazily on first draw by _CdIconFor();
+  // drop the cached icons of discs that have gone away.
+  _PruneCdIcons(mountedCDs);
+
+  bool selectedCDRemoved = false;
+
+  for (int32 i = CountItems() - 1; i >= 0; --i) {
+    if (KindAt(i) == PlaylistItemKind::CD) {
+      BString existingPath = PathAt(i);
+      bool stillMounted = false;
+      for (const auto &cd : mountedCDs) {
+        if (cd.path == existingPath) {
+          stillMounted = true;
+          break;
+        }
+      }
+      if (!stillMounted) {
+        if (fCurrentSelection == i)
+          selectedCDRemoved = true;
+
+        SingleColumnListView::RemoveItemAt(i);
+        if ((size_t)i < fRows.size())
+          fRows.erase(fRows.begin() + i);
+
+        if (fCurrentSelection > i)
+          fCurrentSelection--;
+      }
+    }
+  }
+
+  for (const auto &cd : mountedCDs) {
+    int32 existingIndex = -1;
+    for (int32 i = 0; i < CountItems(); ++i) {
+      if (KindAt(i) == PlaylistItemKind::CD && PathAt(i) == cd.path) {
+        existingIndex = i;
+        break;
+      }
+    }
+
+    if (existingIndex >= 0) {
+      if ((size_t)existingIndex < fItems.size()) {
+        fItems[existingIndex].text = cd.label;
+        fItems[existingIndex].path = cd.path;
+      }
+      if ((size_t)existingIndex < fRows.size()) {
+        fRows[existingIndex].label = cd.label;
+        fRows[existingIndex].writable = false;
+        fRows[existingIndex].kind = PlaylistItemKind::CD;
+      }
+    } else {
+      int32 insertIndex = 1;
+      for (int32 i = 0; i < CountItems(); ++i) {
+        if (KindAt(i) == PlaylistItemKind::CD) {
+          insertIndex = i + 1;
+        }
+      }
+      if (insertIndex > CountItems())
+        insertIndex = CountItems();
+
+      fItems.insert(fItems.begin() + insertIndex, SimpleItem{cd.label, cd.path, false});
+      fRows.insert(fRows.begin() + insertIndex, PlaylistRow{cd.label, false, PlaylistItemKind::CD});
+    }
+  }
+
+  Invalidate();
+  UpdateScrollbars();
+
+  if (selectedCDRemoved) {
+    SelectByName("Library");
+  }
+}
+
+int32 PlaylistSidebarView::SetCDItem(const char *title, const char *path) {
+  SyncCDItems({{BString(title), BString(path)}});
+  return FindIndexByName(title);
+}
+
+void PlaylistSidebarView::RemoveCDItem() {
+  SyncCDItems({});
 }
 
 bool PlaylistSidebarView::IsWritableAt(int32 index) const {
@@ -565,7 +746,7 @@ void PlaylistSidebarView::Draw(BRect updateRect) {
         rowRect.top + floorf((rowRect.Height() + 1 - fIconSize) / 2.0f);
 
     if ((size_t)i < fRows.size()) {
-      if (BBitmap *icon = _IconFor(fRows[i].kind)) {
+      if (BBitmap *icon = _IconFor(fRows[i].kind, PathAt(i))) {
 
         SetDrawingMode(B_OP_ALPHA);
         SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
@@ -687,6 +868,13 @@ void PlaylistSidebarView::SetPlaylistOrder(const std::vector<BString> &order) {
     newRows.push_back(fRows[libIndex]);
   }
 
+  for (size_t i = 0; i < fRows.size(); ++i) {
+    if (fRows[i].kind == PlaylistItemKind::CD) {
+      newItems.push_back(fItems[i]);
+      newRows.push_back(fRows[i]);
+    }
+  }
+
   int32 radioIndex = FindIndexByName("Radio");
   if (radioIndex >= 0 && radioIndex < (int32)fItems.size()) {
     newItems.push_back(fItems[radioIndex]);
@@ -703,7 +891,8 @@ void PlaylistSidebarView::SetPlaylistOrder(const std::vector<BString> &order) {
     if (name == "Library" || name == "Radio" || name == "DLNA")
       continue;
     int32 currentIndex = FindIndexByName(name);
-    if (currentIndex >= 0 && currentIndex < (int32)fItems.size()) {
+    if (currentIndex >= 0 && currentIndex < (int32)fItems.size() &&
+        fRows[currentIndex].kind != PlaylistItemKind::CD) {
       newItems.push_back(fItems[currentIndex]);
       newRows.push_back(fRows[currentIndex]);
       DEBUG_PRINT("  Found '%s' at index %ld\n",
@@ -713,7 +902,8 @@ void PlaylistSidebarView::SetPlaylistOrder(const std::vector<BString> &order) {
 
   for (size_t i = 0; i < fItems.size(); ++i) {
     const BString &name = fItems[i].text;
-    if (name == "Library" || name == "Radio" || name == "DLNA")
+    if (name == "Library" || name == "Radio" || name == "DLNA" ||
+        fRows[i].kind == PlaylistItemKind::CD)
       continue;
     if (targetPositions.find(name) == targetPositions.end()) {
       newItems.push_back(fItems[i]);

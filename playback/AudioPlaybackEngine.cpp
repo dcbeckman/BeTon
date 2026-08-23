@@ -5,6 +5,10 @@
 #include "Messages.h"
 #include "NetworkAudioStreamIO.h"
 
+#if ENABLE_LOCAL_OUTPUT
+#include "AudioOutputManager.h"
+#endif
+
 #include <Entry.h>
 #include <File.h>
 #include <Message.h>
@@ -13,6 +17,7 @@
 #include <Path.h>
 #include <Url.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdio.h>
 #include <vector>
@@ -221,7 +226,12 @@ static bool ComputeMidiDuration(const entry_ref &ref, bigtime_t &duration,
 
 AudioPlaybackEngine::AudioPlaybackEngine() {}
 
-AudioPlaybackEngine::~AudioPlaybackEngine() { Stop(); }
+AudioPlaybackEngine::~AudioPlaybackEngine() {
+#if ENABLE_LOCAL_OUTPUT
+  _WaitForPrime();
+#endif
+  Stop();
+}
 
 /**
  * @brief Sets the messenger for notifying the UI about playback events.
@@ -272,6 +282,8 @@ void AudioPlaybackEngine::_CleanupMedia() {
     snooze(50000);
   }
 
+  _StopPrebufferThread();
+
   if (fPlayer) {
     snooze(20000);
     delete fPlayer;
@@ -296,6 +308,12 @@ void AudioPlaybackEngine::_CleanupMedia() {
     delete fNetworkStream;
     fNetworkStream = nullptr;
   }
+#if ENABLE_LOCAL_OUTPUT
+  // Safe here: the player is deleted and we waited for fInCallback to clear
+  // above, so the audio thread is no longer touching fResampler.
+  fResampler.Unset();
+  fLocalOutputManager.Release();
+#endif
 }
 
 /**
@@ -309,6 +327,10 @@ void AudioPlaybackEngine::SetVolume(float vol) {
   if (vol > 1.0f)
     vol = 1.0f;
   fVolume = vol;
+#if ENABLE_LOCAL_OUTPUT
+  // Keep the direct-mode software gain in step with the volume slider.
+  _RecomputeDirectGain();
+#endif
 
 #if ENABLE_DLNA_OUTPUT
   if (fDlnaManager && fDlnaManager->IsRemoteOutput()) {
@@ -337,7 +359,13 @@ void AudioPlaybackEngine::SetVolume(float vol) {
 #endif
 
   if (fPlayer) {
+#if ENABLE_LOCAL_OUTPUT
+    if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+      fPlayer->SetVolume(fVolume);
+    }
+#else
     fPlayer->SetVolume(fVolume);
+#endif
   }
   if (fMidiSynth) {
     fMidiSynth->SetVolume(fVolume);
@@ -379,7 +407,15 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
     fadeOut = totalFrames;
     fFadeOutFrames.store(fadeOut, std::memory_order_relaxed);
   }
-  if (fadeIn <= 0 && fadeOut <= 0)
+
+  bool needSoftwareVolume = false;
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    needSoftwareVolume = true;
+  }
+#endif
+
+  if (fadeIn <= 0 && fadeOut <= 0 && !needSoftwareVolume)
     return;
 
   auto gainForFrame = [&](int64 frame) {
@@ -388,6 +424,13 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
       gain *= static_cast<float>(totalFrames - fadeIn + frame) / totalFrames;
     if (fadeOut > 0)
       gain *= static_cast<float>(fadeOut - frame) / totalFrames;
+
+    if (needSoftwareVolume) {
+      // fDirectGain already folds in the user's volume AND the mixer-curve
+      // loudness match (or just the volume when no compensation is active).
+      gain *= fDirectGain.load(std::memory_order_relaxed);
+    }
+
     if (gain < 0.0f)
       return 0.0f;
     if (gain > 1.0f)
@@ -434,6 +477,130 @@ void AudioPlaybackEngine::_ApplyFade(void *buffer, size_t size,
     fFadeOutFrames.store(std::max<int64>(0, fadeOut - frames),
                          std::memory_order_relaxed);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+// Extra source frames kept buffered inside the resampler so a full device
+// buffer can always be produced despite the converter's fractional-frame
+// latency (avoids a perpetual 1-frame shortfall when upsampling).
+static const int64 kResampleCushion = 128;
+
+int64 AudioPlaybackEngine::_FillResampled(void *buffer, int64 wantFrames,
+                                          bool &hitEof) {
+  hitEof = false;
+  const int srcFrameSize = fResampler.SrcFrameSize();
+  const int dstFrameSize = fResampler.DstFrameSize();
+  if (!fTrack || srcFrameSize <= 0 || dstFrameSize <= 0 || wantFrames <= 0)
+    return 0;
+
+  uint8 *out = (uint8 *)buffer;
+  int64 outFilled = 0;
+
+  // A resampler cannot emit output without being fed input (its filter needs
+  // upcoming samples), so we ALWAYS feed source here — never a zero-input
+  // drain. Feeding SourceFramesForOutput(need) plus a small cushion lets each
+  // convert emit the full `need`, buffering the cushion. SourceFramesForOutput
+  // subtracts what is already buffered, so the buffer stays ~cushion-sized and
+  // does not grow. The guard is a hard stop so the callback can never spin.
+  for (int guard = 0; outFilled < wantFrames && guard < 64; ++guard) {
+    int64 need = wantFrames - outFilled;
+    uint8 *dst = out + outFilled * dstFrameSize;
+
+    if (hitEof) {
+      // Flush the resampler's final tail (NULL input) after end-of-stream.
+      int64 got = fResampler.Convert(nullptr, 0, dst, need);
+      outFilled += got;
+      if (got == 0)
+        break;
+      continue;
+    }
+
+    int64 srcNeed = fResampler.SourceFramesForOutput(need) + kResampleCushion;
+    size_t needBytes = (size_t)srcNeed * srcFrameSize;
+    if (fResampleScratch.size() < needBytes)
+      fResampleScratch.resize(needBytes); // defensive; normally pre-sized
+
+    int64 srcFrames = srcNeed;
+    status_t ret = fTrack->ReadFrames(fResampleScratch.data(), &srcFrames);
+    if (ret != B_OK || srcFrames <= 0) {
+      int32 zeroCount = fZeroReadCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (zeroCount > 15 || ret == B_LAST_BUFFER_ERROR) {
+        hitEof = true;
+      }
+      continue; // flush on the next pass
+    }
+    fZeroReadCount.store(0, std::memory_order_relaxed);
+    outFilled += fResampler.Convert(fResampleScratch.data(), srcFrames, dst,
+                                    need);
+  }
+
+  return outFilled;
+}
+
+// Replicate the Haiku audio mixer's non-linear dB->gain curve
+// (src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp dB_to_Gain). The
+// mixer's gain sliders report a warped "dB" value, so a displayed -39.7 dB is
+// NOT 10^(-39.7/20) of linear gain. To match the mixer's actual loudness we
+// must run its displayed dB through the same curve.
+static float MixerDbToGain(float db) {
+  const float kDbMax = 18.0f;
+  const float kDbMin = -60.0f;
+  const float kExpPos = 1.4f;
+  const float kExpNeg = 1.8f;
+  if (db > 0.0f) {
+    db = db * (powf(fabsf(kDbMax), 1.0f / kExpPos) / fabsf(kDbMax));
+    db = powf(db, kExpPos);
+  } else {
+    db = -db;
+    db = db * (powf(fabsf(kDbMin), 1.0f / kExpNeg) / fabsf(kDbMin));
+    db = powf(db, kExpNeg);
+    db = -db;
+  }
+  return powf(10.0f, db / 20.0f);
+}
+
+void AudioPlaybackEngine::_RecomputeDirectGain() {
+  float v = fVolume.load(std::memory_order_relaxed);
+  if (!fDirectCompActive.load(std::memory_order_relaxed)) {
+    // No mixer compensation (fell back to mixer, or not yet connected):
+    // apply just the user's volume, as before.
+    fDirectGain.store(v, std::memory_order_relaxed);
+    return;
+  }
+  // Replicate the mixer's total gain on our stream: its non-linear volume
+  // curve applied to fVolume (BSoundPlayer::SetVolume sets the mixer input to
+  // 20*log10(fVolume) displayed dB) times its master gain, both via the mixer
+  // curve. This is the exact loudness the mixer path would produce.
+  float volDb = v > 0.0f ? 20.0f * log10f(v) : -144.0f;
+  float g = MixerDbToGain(volDb) * MixerDbToGain(fMixerMasterDb.load(std::memory_order_relaxed));
+  // The mixer applies a straight x0.708 (~ -3 dB) to its output when the
+  // "Attenuate mixer output by 3 dB" toggle is on; replicate it if set.
+  if (fMixerAttenuate3dB.load(std::memory_order_relaxed))
+    g *= 0.708f;
+  if (g > 1.0f)
+    g = 1.0f;
+  if (g < 0.0f)
+    g = 0.0f;
+  fDirectGain.store(g, std::memory_order_relaxed);
+}
+
+void AudioPlaybackEngine::_UpdateDirectGain() {
+  float dB = 0.0f;
+  if (fLocalOutputManager.GetSystemMixerGainDB(dB) == B_OK) {
+    fMixerMasterDb.store(dB, std::memory_order_relaxed);
+    fMixerAttenuate3dB.store(fLocalOutputManager.GetSystemMixerAttenuate3dB(),
+                             std::memory_order_relaxed);
+    fDirectCompActive.store(true, std::memory_order_relaxed);
+    _RecomputeDirectGain();
+    DEBUG_PRINT("Direct gain: mixer master %.2f dB (curve) atten3dB=%d x fVol "
+                "-> gain x%.4f\n", dB,
+                (int)fMixerAttenuate3dB.load(), fDirectGain.load());
+  } else {
+    fDirectCompActive.store(false, std::memory_order_relaxed);
+    _RecomputeDirectGain();
+    DEBUG_PRINT("Could not read mixer gain; direct gain = fVolume only\n");
+  }
+}
+#endif
 
 status_t AudioPlaybackEngine::_StartMidiAt(int32 position) {
   if (!fMidiSynth)
@@ -502,6 +669,61 @@ void AudioPlaybackEngine::_SilenceMidi() {
   fMidiSynth->SetVolume(0.0);
 }
 
+void AudioPlaybackEngine::_StartPrebufferThread(int frameSize) {
+  _StopPrebufferThread();
+  fPrebufferFrameSize = frameSize > 0 ? frameSize : 4;
+  fReaderEof.store(false, std::memory_order_relaxed);
+  fPrebufferRing.Init(524288);
+  fPrebufferRunning.store(true, std::memory_order_relaxed);
+  fPrebufferThread = spawn_thread(_PrebufferThreadEntry, "cd_prebuffer", B_NORMAL_PRIORITY, this);
+  if (fPrebufferThread >= 0) {
+    resume_thread(fPrebufferThread);
+    fUsePrebuffer.store(true, std::memory_order_relaxed);
+    DEBUG_PRINT("Background prebuffer thread started\n");
+  }
+}
+
+void AudioPlaybackEngine::_StopPrebufferThread() {
+  fUsePrebuffer.store(false, std::memory_order_relaxed);
+  if (fPrebufferRunning.exchange(false)) {
+    if (fPrebufferThread >= 0) {
+      status_t exitVal;
+      wait_for_thread(fPrebufferThread, &exitVal);
+      fPrebufferThread = -1;
+    }
+  }
+  fPrebufferRing.Reset();
+}
+
+int32 AudioPlaybackEngine::_PrebufferThreadEntry(void *cookie) {
+  AudioPlaybackEngine *self = static_cast<AudioPlaybackEngine *>(cookie);
+  if (self)
+    self->_PrebufferThreadFunc();
+  return 0;
+}
+
+void AudioPlaybackEngine::_PrebufferThreadFunc() {
+  const int frameSize = fPrebufferFrameSize;
+  const int64 kFramesPerRead = 4096;
+  const size_t kBytesPerRead = (size_t)kFramesPerRead * frameSize;
+  std::vector<uint8> scratch(kBytesPerRead);
+  while (fPrebufferRunning.load(std::memory_order_relaxed)) {
+    if (!fReaderEof.load(std::memory_order_relaxed) &&
+        fPrebufferRing.AvailableWrite() >= kBytesPerRead) {
+      int64 framesToRead = kFramesPerRead;
+      status_t ret = fTrack ? fTrack->ReadFrames(scratch.data(), &framesToRead) : B_ERROR;
+      if (ret == B_OK && framesToRead > 0) {
+        size_t bytesRead = (size_t)framesToRead * frameSize;
+        fPrebufferRing.Write(scratch.data(), bytesRead);
+      } else {
+        fReaderEof.store(true, std::memory_order_relaxed);
+      }
+    } else {
+      snooze(10000);
+    }
+  }
+}
+
 /**
  * @brief Plays the track at the specified index in the queue.
  *
@@ -516,6 +738,12 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+  fZeroReadCount.store(0);
+#if ENABLE_LOCAL_OUTPUT
+  // Default to no compensation; the direct-connect path enables it on success.
+  fDirectCompActive.store(false, std::memory_order_relaxed);
+  _RecomputeDirectGain();
+#endif
 
   Stop(true);
   snooze(10000);
@@ -696,18 +924,133 @@ void AudioPlaybackEngine::Play(size_t trackIndex) {
               raf.byte_order == B_MEDIA_BIG_ENDIAN ? "BE" : "LE",
               (long)raf.buffer_size);
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    // Read the mixer's master gain and set the loudness compensation BEFORE
+    // Acquire() disconnects the mixer — a disconnected mixer reports a default
+    // gain, which would defeat the match.
+    _UpdateDirectGain();
+
+    media_node node;
+    media_input input;
+    status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
+    if (acquireStatus == B_OK) {
+      // Leave the format wildcarded so the connection negotiates to the
+      // device/bus's supported format instead of forcing the file's format.
+      // A rate-fixed device (e.g. 48 kHz only) would otherwise fail to
+      // connect on a 44.1 kHz file. We then resample the decoded stream to
+      // the negotiated format ourselves (see the resampler setup below).
+      media_multi_audio_format format = media_multi_audio_format::wildcard;
+
+      fPlayer = new BSoundPlayer(node, &format, "Orchester", &input, &_PlayBuffer, NULL, this);
+
+      if (fPlayer && fPlayer->InitCheck() == B_OK) {
+        // The decoder emits the file's NATIVE format (raf, from DecodedFormat
+        // above) and does not resample the sample rate — only the system
+        // mixer does. A physical device node may run at a fixed, different
+        // rate (e.g. 48/96 kHz), so feeding native-rate frames straight to it
+        // played too fast/high-pitched ("chipmunks"). Convert native ->
+        // negotiated device format ourselves via libswresample.
+        media_raw_audio_format devFmt = fPlayer->Format();
+        status_t rs = fResampler.Init(raf, devFmt);
+        if (rs != B_OK) {
+          DEBUG_PRINT("Resampler init failed (%s), falling back to mixer\n",
+                      strerror(rs));
+          delete fPlayer;
+          fPlayer = nullptr;
+          fLocalOutputManager.Release();
+          fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+        } else {
+          // Pre-size the source scratch for one device buffer so the audio
+          // callback never allocates: worst-case source frames per callback.
+          if (fResampler.IsActive() && fResampler.SrcFrameSize() > 0) {
+            int64 dstFrames = fResampler.DstFrameSize() > 0
+                ? (int64)(devFmt.buffer_size / fResampler.DstFrameSize()) : 0;
+            int64 srcFrames = fResampler.SourceFramesForOutput(dstFrames)
+                + kResampleCushion + 64;
+            fResampleScratch.resize((size_t)srcFrames * fResampler.SrcFrameSize());
+          }
+          DEBUG_PRINT("Direct output: decoded %.0f Hz/%dch -> device %.0f Hz/%dch"
+                      " buffer_size=%ld (%s)\n", raf.frame_rate,
+                      (int)raf.channel_count, devFmt.frame_rate,
+                      (int)devFmt.channel_count, (long)devFmt.buffer_size,
+                      fResampler.IsActive() ? "resampling" : "passthrough");
+          // Display the track's native rate/channels, not the device's.
+          fCurrentSampleRate.store((int32)raf.frame_rate);
+          fCurrentChannels.store((int32)raf.channel_count);
+        }
+      } else {
+        // Direct connection failed (e.g. device rejected the format).
+        // Release the device (restores the mixer) and fall back to default.
+        DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        fDirectCompActive.store(false, std::memory_order_relaxed);
+        _RecomputeDirectGain();
+        delete fPlayer;
+        fPlayer = nullptr;
+        fLocalOutputManager.Release();
+        if (fTarget.IsValid()) {
+          BMessage errMsg(MSG_STATUS_UPDATE);
+          errMsg.AddString("text", "Device unavailable, falling back to system default");
+          fTarget.SendMessage(&errMsg);
+        }
+        fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+      }
+    } else {
+      DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      fDirectCompActive.store(false, std::memory_order_relaxed);
+      _RecomputeDirectGain();
+      if (fTarget.IsValid()) {
+        BMessage errMsg(MSG_STATUS_UPDATE);
+        errMsg.AddString("text", "Device in use, falling back to system default");
+        fTarget.SendMessage(&errMsg);
+      }
+      fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+    }
+  } else {
+    fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+  }
+#else
   fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
-  if (!fPlayer) {
-    DEBUG_PRINT("BSoundPlayer new failed\n");
+#endif
+
+  if (!fPlayer || fPlayer->InitCheck() != B_OK) {
+    DEBUG_PRINT("BSoundPlayer new/init failed\n");
     _CleanupMedia();
     return;
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+    fPlayer->SetVolume(fVolume);
+  }
+#else
   fPlayer->SetVolume(fVolume);
+#endif
   _BeginFadeIn();
 
   fPlayer->Start();
   fPlayer->SetHasData(true);
+
+  // The prebuffer thread reads native frames from fTrack in the background
+  // and is the callback's only reader on that path. When the direct-output
+  // resampler is active, _PlayBuffer's _FillResampled() branch reads fTrack
+  // itself instead (see below) — starting the prebuffer thread too would
+  // have two threads calling BMediaTrack::ReadFrames() concurrently.
+#if ENABLE_LOCAL_OUTPUT
+  if (!fResampler.IsActive()) {
+    const int nativeFrameSize =
+        (raf.format & media_raw_audio_format::B_AUDIO_SIZE_MASK) *
+        raf.channel_count;
+    _StartPrebufferThread(nativeFrameSize);
+  }
+#else
+  {
+    const int nativeFrameSize =
+        (raf.format & media_raw_audio_format::B_AUDIO_SIZE_MASK) *
+        raf.channel_count;
+    _StartPrebufferThread(nativeFrameSize);
+  }
+#endif
 
   if (fTarget.IsValid()) {
     BMessage m(MSG_NOW_PLAYING);
@@ -740,6 +1083,12 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
   fCurrentBitrate.store(0);
   fCurrentSampleRate.store(0);
   fCurrentChannels.store(0);
+#if ENABLE_LOCAL_OUTPUT
+  fDirectCompActive.store(false, std::memory_order_relaxed);
+  _RecomputeDirectGain();
+#endif
+  fCurrentUrl = url;
+  fCurrentTitle = title ? title : "";
 
   BAutolock lock(fPlayLock);
   DEBUG_PRINT("PlayUrl(%s, duration=%ld) called\n",
@@ -803,6 +1152,19 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
   fNetworkStream =
       new NetworkAudioStreamIO(fTarget, context ? context : &fUrlContext);
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (roster && roster->GetFormatFor(fLocalOutputBus.input, &fmt) == B_OK) {
+      if (fmt.type == B_MEDIA_RAW_AUDIO) {
+        fNetworkStream->SetTargetFormat(fmt.u.raw_audio.frame_rate, fmt.u.raw_audio.channel_count);
+      }
+    }
+  }
+#endif
+
   NetworkAudioStreamIO::Mode mode = NetworkAudioStreamIO::MODE_ICY;
   if (url.UrlString().IEndsWith(".m3u8"))
     mode = NetworkAudioStreamIO::MODE_HLS;
@@ -855,14 +1217,75 @@ void AudioPlaybackEngine::PlayUrl(const BUrl &url, const char *title,
                 prebufferBytes, (long)prebufferStatus);
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget != OutputTarget::SystemDefault) {
+    // Read mixer gain before Acquire() disconnects the mixer (see Play()).
+    _UpdateDirectGain();
+
+    media_node node;
+    media_input input;
+    status_t acquireStatus = fLocalOutputManager.Acquire(fLocalOutputBus, fLocalOutputTarget, fLocalConflictPolicy, fLocalFallbackDevice, node, input);
+    if (acquireStatus == B_OK) {
+      // Wildcard the format so the connection negotiates to the device's
+      // supported format rather than forcing the stream's format (see Play()).
+      media_multi_audio_format format = media_multi_audio_format::wildcard;
+
+      fPlayer = new BSoundPlayer(node, &format, "Orchester", &input, &_PlayBuffer, NULL, this);
+
+      if (fPlayer && fPlayer->InitCheck() == B_OK) {
+        // NOTE: the stream's resample target was already set before Open()
+        // (via GetFormatFor(bus.input) above), so WaitForFormat() returned the
+        // bus-format raf and the wildcard connection negotiates to match it.
+        // We only refresh the display fields here.
+        media_raw_audio_format pf = fPlayer->Format();
+        fCurrentSampleRate.store(pf.frame_rate);
+        fCurrentChannels.store(pf.channel_count);
+      } else {
+        // Direct connection failed; release the device and fall back.
+        DEBUG_PRINT("Direct BSoundPlayer InitCheck failed, falling back to default mixer\n");
+        fDirectCompActive.store(false, std::memory_order_relaxed);
+        _RecomputeDirectGain();
+        delete fPlayer;
+        fPlayer = nullptr;
+        fLocalOutputManager.Release();
+        if (fTarget.IsValid()) {
+          BMessage errMsg(MSG_STATUS_UPDATE);
+          errMsg.AddString("text", "Device unavailable, falling back to system default");
+          fTarget.SendMessage(&errMsg);
+        }
+        fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+      }
+    } else {
+      DEBUG_PRINT("Acquire device failed, falling back to default mixer\n");
+      fDirectCompActive.store(false, std::memory_order_relaxed);
+      _RecomputeDirectGain();
+      if (fTarget.IsValid()) {
+        BMessage errMsg(MSG_STATUS_UPDATE);
+        errMsg.AddString("text", "Device in use, falling back to system default");
+        fTarget.SendMessage(&errMsg);
+      }
+      fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+    }
+  } else {
+    fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
+  }
+#else
   fPlayer = new BSoundPlayer(&raf, "Orchester", &_PlayBuffer, NULL, this);
-  if (!fPlayer) {
+#endif
+
+  if (!fPlayer || fPlayer->InitCheck() != B_OK) {
     _CleanupMedia();
     fIsStreaming.store(false, std::memory_order_relaxed);
     return;
   }
 
+#if ENABLE_LOCAL_OUTPUT
+  if (fLocalOutputTarget == OutputTarget::SystemDefault) {
+    fPlayer->SetVolume(fVolume);
+  }
+#else
   fPlayer->SetVolume(fVolume);
+#endif
   _BeginFadeIn();
   fPlayer->Start();
   fPlayer->SetHasData(true);
@@ -1129,6 +1552,15 @@ void AudioPlaybackEngine::SeekTo(bigtime_t pos) {
     return;
   }
 
+  // Serialize against teardown. _CleanupMedia() releases fTrack (destroying the
+  // decoder) and only then clears the pointer, all under fPlayLock. Without
+  // holding it here, a seek can pass the null-check below, get preempted while
+  // ReleaseTrack() destroys the decoder, then call SeekToTime() on freed memory
+  // — AVCodecDecoder::SeekedTo() re-frees its stale fChunkBuffer and the heap
+  // aborts with a double free. Seeking to the end of a track makes this likely,
+  // since hitting the end starts teardown just as the seek is handled.
+  BAutolock lock(fPlayLock);
+
   if (!fTrack || fIsStreaming.load(std::memory_order_relaxed) || fIsMidiPlaying)
     return;
 
@@ -1151,6 +1583,9 @@ void AudioPlaybackEngine::Shutdown() {
   BAutolock lock(fPlayLock);
   fShuttingDown = true;
   fAtEnd = true;
+#if ENABLE_LOCAL_OUTPUT
+  _WaitForPrime();
+#endif
   _StopTimeUpdates();
 
   if (fPlayer) {
@@ -1315,11 +1750,83 @@ void AudioPlaybackEngine::_PlayBuffer(
       format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
   const int frameSize = bytesPerSample * format.channel_count;
   int64 frames = frameSize > 0 ? (int64)(size / frameSize) : 0;
+
+#if ENABLE_LOCAL_OUTPUT
+  // Direct output to a device whose rate/channels differ from the decoded
+  // file: pull native frames and convert them to the device format. When the
+  // formats match, fResampler is inactive and we fall through to the plain
+  // ReadFrames path below.
+  if (self->fResampler.IsActive()) {
+    bool hitEof = false;
+    int64 filled = self->_FillResampled(buffer, frames, hitEof);
+    size_t produced = (size_t)filled * frameSize;
+    if (filled > 0) {
+      self->fCurrentPos +=
+          (bigtime_t)((filled * 1000000LL) / (int)format.frame_rate);
+      self->_ApplyFade(buffer, produced, format);
+    }
+    if (produced < size)
+      memset((uint8 *)buffer + produced, 0, size - produced);
+    // Only end the track on a real end-of-stream from the decoder. A short
+    // fill without EOF is just converter latency and is padded with silence.
+    if (hitEof) {
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true) &&
+          self->fTarget.IsValid()) {
+        BMessage m(MSG_TRACK_ENDED);
+        self->fTarget.SendMessage(&m);
+      }
+    }
+    self->fInCallback.store(false, std::memory_order_relaxed);
+    return;
+  }
+#endif
+
+  if (self->fUsePrebuffer.load(std::memory_order_relaxed)) {
+    size_t readBytes = self->fPrebufferRing.Read((uint8 *)buffer, size);
+    if (readBytes > 0) {
+      self->fZeroReadCount.store(0, std::memory_order_relaxed);
+      if (frameSize > 0) {
+        int64 readFrames = (int64)readBytes / frameSize;
+        self->fCurrentPos +=
+            (bigtime_t)((readFrames * 1000000LL) / (int)format.frame_rate);
+      }
+      self->_ApplyFade(buffer, readBytes, format);
+      if (readBytes < size)
+        memset((uint8 *)buffer + readBytes, 0, size - readBytes);
+    } else if (self->fReaderEof.load(std::memory_order_relaxed)) {
+      memset(buffer, 0, size);
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true)) {
+        if (self->fTarget.IsValid()) {
+          BMessage m(MSG_TRACK_ENDED);
+          self->fTarget.SendMessage(&m);
+        }
+      }
+    } else {
+      memset(buffer, 0, size);
+    }
+    self->fInCallback.store(false, std::memory_order_relaxed);
+    return;
+  }
+
   status_t ret = B_ERROR;
   if (self->fTrack && frames > 0)
     ret = self->fTrack->ReadFrames(buffer, &frames);
 
+  static int sCbCount = 0;
+  if (++sCbCount % 50 == 0 || ret != B_OK || frames <= 0) {
+    DEBUG_PRINT("_PlayBuffer cb=%d ret=%s (%d) frames=%lld size=%zu vol=%.2f\n",
+                sCbCount, strerror(ret), (int)ret, (long long)frames, size,
+                self->fVolume.load(std::memory_order_relaxed));
+  }
+
   if (ret == B_OK && frames > 0) {
+    self->fZeroReadCount.store(0, std::memory_order_relaxed);
     self->fCurrentPos +=
         (bigtime_t)((frames * 1000000LL) / (int)format.frame_rate);
     size_t produced = (size_t)frames * frameSize;
@@ -1344,20 +1851,119 @@ void AudioPlaybackEngine::_PlayBuffer(
       snooze(10000); ///< Prevent tight loop if network is just slow
   } else {
     /// End of stream or error (local files only)
-    bool expected = false;
-    if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
-        !self->fStopping.load(std::memory_order_relaxed) &&
-        self->fAtEnd.compare_exchange_strong(expected, true)) {
+    memset(buffer, 0, size);
+    int32 zeroCount = self->fZeroReadCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (zeroCount > 15 || ret == B_LAST_BUFFER_ERROR) {
+      bool expected = false;
+      if (!self->fShuttingDown.load(std::memory_order_relaxed) &&
+          !self->fStopping.load(std::memory_order_relaxed) &&
+          self->fAtEnd.compare_exchange_strong(expected, true)) {
 
-      memset(buffer, 0, size);
-      if (self->fTarget.IsValid()) {
-        BMessage m(MSG_TRACK_ENDED);
-        self->fTarget.SendMessage(&m);
+        if (self->fTarget.IsValid()) {
+          BMessage m(MSG_TRACK_ENDED);
+          self->fTarget.SendMessage(&m);
+        }
       }
-    } else {
-      memset(buffer, 0, size);
     }
   }
 
   self->fInCallback.store(false, std::memory_order_relaxed);
 }
+
+#if ENABLE_LOCAL_OUTPUT
+namespace {
+struct PrimeData {
+  AudioPlaybackEngine *self;
+  OutputBusInfo bus;
+};
+} // namespace
+
+int32 AudioPlaybackEngine::_PrimeThreadEntry(void *arg) {
+  PrimeData *d = static_cast<PrimeData *>(arg);
+  d->self->fLocalOutputManager.Prime(d->bus);
+  delete d;
+  return 0;
+}
+
+void AudioPlaybackEngine::_WaitForPrime() {
+  thread_id t = fPrimeThread.exchange(-1, std::memory_order_relaxed);
+  if (t >= 0) {
+    status_t ret;
+    wait_for_thread(t, &ret);
+  }
+}
+
+void AudioPlaybackEngine::_SpawnPrime() {
+  // One prime at a time; join any prior one so fLocalOutputBus (captured
+  // below) is stable for its lifetime and it never races teardown.
+  _WaitForPrime();
+  PrimeData *d = new PrimeData{this, fLocalOutputBus};
+  thread_id t =
+      spawn_thread(_PrimeThreadEntry, "beton_prime", B_NORMAL_PRIORITY, d);
+  if (t >= 0) {
+    fPrimeThread.store(t, std::memory_order_relaxed);
+    resume_thread(t);
+  } else {
+    delete d;
+  }
+}
+
+void AudioPlaybackEngine::SetOutputDevice(OutputTarget target,
+                                         const OutputBusInfo& bus,
+                                         MixerConflictPolicy policy,
+                                         const BString& fallbackDeviceName) {
+  BAutolock lock(fPlayLock);
+
+  if (fLocalOutputTarget == target &&
+      fLocalConflictPolicy == policy &&
+      fLocalFallbackDevice == fallbackDeviceName &&
+      (target == OutputTarget::SystemDefault ||
+       (fLocalOutputBus.deviceName == bus.deviceName &&
+        fLocalOutputBus.busName == bus.busName))) {
+    return;
+  }
+
+  DEBUG_PRINT("SetOutputDevice called, switching output...\n");
+
+  bool wasPlaying = IsPlaying();
+  bool wasPaused = IsPaused();
+  bigtime_t currentPos = fCurrentPos.load();
+  bool isStream = IsStreaming();
+  BUrl savedUrl = fCurrentUrl;
+  BString savedTitle = fCurrentTitle;
+  size_t savedIdx = fCurrentIdx.load();
+
+  // 1. Stop current playback to release player and output manager node resources
+  _StopLocked(true);
+
+  // 2. Apply new parameters
+  fLocalOutputTarget = target;
+  fLocalOutputBus = bus;
+  fLocalConflictPolicy = policy;
+  fLocalFallbackDevice = fallbackDeviceName;
+
+  // 3. Resume if we were playing or paused
+  if (wasPlaying || wasPaused) {
+    if (isStream) {
+      PlayUrl(savedUrl, savedTitle);
+      if (wasPaused) {
+        Pause();
+      }
+    } else {
+      Play(savedIdx);
+      if (currentPos > 0) {
+        SeekTo(currentPos);
+      }
+      if (wasPaused) {
+        Pause();
+      }
+    }
+  } else if (target != OutputTarget::SystemDefault) {
+    // Nothing playing (startup restore, or the user picked a device while
+    // stopped): warm the device in the background so the first Play() connects
+    // to a running node instead of paying the cold-start settle on the play
+    // path. Skipped when resuming above, since that Play() warms it anyway.
+    _SpawnPrime();
+  }
+}
+#endif

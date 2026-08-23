@@ -4,6 +4,7 @@
 #include "Messages.h"
 #include "MetadataTagIO.h"
 
+#include <Autolock.h>
 #include <Node.h>
 #include <Path.h>
 #include <SupportDefs.h>
@@ -22,13 +23,14 @@
  *
  * @param startDir The root directory this scanner is responsible for.
  * @param cacheTarget Messenger to the MediaLibraryCache (for batch updates).
- * @param liveTarget Messenger to the UI (MainWindow) for progress updates.
+ * @param scanId Identifies this scanner's reports to the cache.
  */
 MediaLibraryScanner::MediaLibraryScanner(const entry_ref &startDir, BMessenger cacheTarget,
-                           BMessenger liveTarget)
+                           int32 scanId)
     : BLooper("MediaLibraryScanner"), fStartRef(startDir), fCacheTarget(cacheTarget),
-      fLiveTarget(liveTarget), fScanRequested(false), fStopRequested(false),
-      fIsScanning(false), fScannedDirs(0), fFoundFiles(0) {
+      fScanRequested(false), fStopRequested(false),
+      fIsScanning(false), fScanId(scanId), fWorkDirs(0), fWorkFiles(0),
+      fScannedDirs(0), fFoundFiles(0) {
   fLastUpdate = std::chrono::steady_clock::now();
 
   BPath p(&fStartRef);
@@ -47,13 +49,27 @@ MediaLibraryScanner::MediaLibraryScanner(const entry_ref &startDir, BMessenger c
  * Stops the worker thread and cleans up semaphores.
  */
 MediaLibraryScanner::~MediaLibraryScanner() {
-  fStopRequested = true;
-  release_sem(fControlSem);
-
-  status_t exitValue;
-  wait_for_thread(fWorkerThread, &exitValue);
+  RequestStop();
+  WaitForStop();
 
   delete_sem(fControlSem);
+}
+
+void MediaLibraryScanner::RequestStop() {
+  fStopRequested = true;
+  release_sem(fControlSem);
+}
+
+void MediaLibraryScanner::WaitForStop() {
+  const thread_id worker = fWorkerThread;
+  if (worker < 0)
+    return;
+
+  // Cleared first so a second call cannot wait on a reaped thread id.
+  fWorkerThread = -1;
+
+  status_t exitValue;
+  wait_for_thread(worker, &exitValue);
 }
 
 /**
@@ -146,28 +162,12 @@ void MediaLibraryScanner::ProcessFile(BEntry &entry) {
   /**
    * @brief Fast Skip: unchanged files are skipped entirely.
    *
-   * If the file's modification time and size match the cache,
-   * no further processing is needed. All metadata including
-   * the rating is preserved from the cached entry.
+   * A file whose size and mtime still match the cache needs no further
+   * processing, and it was excluded from the workload totals as well, so
+   * skipping it here leaves the progress counter consistent with them.
    */
-  if (!fCache.empty()) {
-    auto it = fCache.find(filePath);
-    if (it != fCache.end()) {
-      const MediaItem &old = it->second;
-      if (old.mtime == st.st_mtime && old.size == st.st_size) {
-        /**
-         * @brief Fast Skip: file unchanged, use cached data as-is.
-         *
-         * The rating is already stored in the cache entry from the
-         * previous scan. Reading it from BFS on every fast-skip was
-         * causing thousands of synchronous I/O operations per scan.
-         * External rating changes (e.g. via Tracker) will be detected
-         * by Node Monitoring (TODO) or on next full rescan.
-         */
-        return;
-      }
-    }
-  }
+  if (!_NeedsScan(filePath, st))
+    return;
 
   fFoundFiles++;
   ReportProgress();
@@ -181,6 +181,11 @@ void MediaLibraryScanner::ProcessFile(BEntry &entry) {
   BString mbTrackId, mbAlbumId, mbArtistId;
 
   if (!isMidiFile) {
+    // Serialised against every other user of TagLib in the process: the
+    // library's implicit sharing is not thread-safe, and nine scanner threads
+    // parsing at once corrupted the heap. See MetadataTagIO::TagLibLock().
+    BAutolock tagGuard(MetadataTagIO::TagLibLock());
+
     try {
       TagLib::FileRef f(path.Path());
 
@@ -314,6 +319,80 @@ void MediaLibraryScanner::ProcessFile(BEntry &entry) {
   }
 }
 
+bool MediaLibraryScanner::_NeedsScan(const BString &filePath,
+                                    const struct stat &st) const {
+  if (fCache.empty())
+    return true;
+
+  auto it = fCache.find(filePath);
+  if (it == fCache.end())
+    return true;
+
+  // The rating and every other tag were stored on the previous scan; re-reading
+  // them from BFS on each pass cost thousands of synchronous reads. External
+  // edits arrive via node monitoring instead.
+  const MediaItem &old = it->second;
+  return old.mtime != st.st_mtime || old.size != st.st_size;
+}
+
+void MediaLibraryScanner::CountWorkload() {
+  fWorkDirs = 0;
+  fWorkFiles = 0;
+
+  std::stack<BString> stack;
+  stack.push(fBasePath);
+
+  while (!stack.empty() && !fStopRequested) {
+    BString currentPath = stack.top();
+    stack.pop();
+
+    BDirectory dir(currentPath.String());
+    if (dir.InitCheck() != B_OK)
+      continue;
+
+    bool dirHasWork = false;
+
+    BEntry entry;
+    dir.Rewind();
+    while (dir.GetNextEntry(&entry, true) == B_OK) {
+      if (fStopRequested)
+        break;
+
+      BPath p;
+      if (entry.GetPath(&p) != B_OK)
+        continue;
+
+      BString leaf(p.Leaf());
+      if (leaf.Length() > 0 && leaf.ByteAt(0) == '.')
+        continue;
+
+      if (entry.IsDirectory()) {
+        stack.push(p.Path());
+        continue;
+      }
+
+      BString filePath(p.Path());
+      if (!IsSupportedAudioFile(filePath))
+        continue;
+
+      struct stat st{};
+      if (stat(p.Path(), &st) != 0)
+        continue;
+
+      if (!_NeedsScan(filePath, st))
+        continue;
+
+      fWorkFiles++;
+      dirHasWork = true;
+    }
+
+    // Only folders that actually contribute work are counted, so the reported
+    // scope matches what the file counter is going to move through.
+    if (dirHasWork)
+      fWorkDirs++;
+  }
+}
+
 /**
  * @brief Sends the current batch of found items to the MediaLibraryCache.
  *
@@ -353,7 +432,10 @@ void MediaLibraryScanner::FlushBatch() {
   fBatchBuffer.clear();
   fBatchLock.Unlock();
 
-  if (fCacheTarget.IsValid())
+  // Nothing is sent once a stop has been asked for: whoever asked may already
+  // be blocked waiting for this thread, and must not have our messages piling
+  // up against a looper that is no longer draining its port.
+  if (!fStopRequested && fCacheTarget.IsValid())
     fCacheTarget.SendMessage(&msg);
 }
 
@@ -369,19 +451,18 @@ void MediaLibraryScanner::ReportProgress() {
       std::chrono::duration_cast<std::chrono::milliseconds>(now - fLastUpdate)
           .count();
 
-  if (elapsed > 100) {
+  if (elapsed > 100 && !fStopRequested) {
     fLastUpdate = now;
-    if (fLiveTarget.IsValid()) {
+    // Reported to the cache rather than straight to the UI: with several
+    // scanners running, only the cache can add their counts together. Sending
+    // to the UI directly is what made the old status line jump between
+    // whichever scanner reported last.
+    if (fCacheTarget.IsValid()) {
       BMessage msg(MSG_SCAN_PROGRESS);
+      msg.AddInt32("scan_id", fScanId);
+      msg.AddInt32("files_done", fFoundFiles);
       msg.AddInt32("dirs", fScannedDirs);
-      msg.AddInt32("files", fFoundFiles);
-
-      auto totalElapsed =
-          std::chrono::duration_cast<std::chrono::seconds>(now - fStartTime)
-              .count();
-      msg.AddInt64("elapsed_sec", totalElapsed);
-
-      fLiveTarget.SendMessage(&msg);
+      fCacheTarget.SendMessage(&msg);
     }
   }
 }
@@ -423,6 +504,21 @@ void MediaLibraryScanner::WorkerMethod() {
       fScannedDirs = 0;
       fFoundFiles = 0;
       fStartTime = std::chrono::steady_clock::now();
+
+      // Count the real workload first so the UI can show a total, a
+      // percentage and a time estimate instead of an open-ended tally.
+      CountWorkload();
+
+      if (fCacheTarget.IsValid()) {
+        BMessage totals(MSG_SCAN_TOTALS);
+        totals.AddInt32("scan_id", fScanId);
+        totals.AddInt32("folders", fWorkDirs);
+        totals.AddInt32("files", fWorkFiles);
+        fCacheTarget.SendMessage(&totals);
+      }
+
+      DEBUG_PRINT("Worker: %d files in %d folders need scanning\n",
+                  (int)fWorkFiles, (int)fWorkDirs);
 
       std::stack<BString> stack;
       stack.push(fBasePath);
@@ -466,27 +562,31 @@ void MediaLibraryScanner::WorkerMethod() {
     if (!fStopRequested) {
       DEBUG_PRINT("Worker: Scan finished\n");
 
+      // Final counts before reporting completion, so the aggregate the cache
+      // publishes ends on the exact totals rather than the last throttled
+      // sample.
       if (fCacheTarget.IsValid()) {
-        fCacheTarget.SendMessage(MSG_SCAN_DONE);
-      }
-
-      if (fLiveTarget.IsValid()) {
-        BMessage doneMsg(MSG_SCAN_DONE);
-        auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now() - fStartTime)
-                                .count();
-        doneMsg.AddInt64("elapsed_sec", totalElapsed);
-        fLiveTarget.SendMessage(&doneMsg);
-
         BMessage progress(MSG_SCAN_PROGRESS);
+        progress.AddInt32("scan_id", fScanId);
+        progress.AddInt32("files_done", fFoundFiles);
         progress.AddInt32("dirs", fScannedDirs);
-        progress.AddInt32("files", fFoundFiles);
-        fLiveTarget.SendMessage(&progress);
+        fCacheTarget.SendMessage(&progress);
+
+        // Carries the id so the cache can retire this scanner: it owns us and
+        // deletes us on completion, which is also what lets it stop every
+        // scanner deterministically when the application quits.
+        BMessage done(MSG_SCAN_DONE);
+        done.AddInt32("scan_id", fScanId);
+        fCacheTarget.SendMessage(&done);
       }
+
+      // Completion is reported to the cache only. It aggregates the scanners
+      // and tells the window once, when the last of them is in. Reporting
+      // straight to the window as well meant it rebuilt the whole item list
+      // and every filter view once per scanner instead of once per scan.
     }
 
     fIsScanning = false;
-    PostMessage(B_QUIT_REQUESTED);
     return;
   }
 }

@@ -630,10 +630,16 @@ NetworkAudioStreamIO::NetworkAudioStreamIO(BMessenger target, BUrlContext *conte
       fContext(context), fRunning(false), fRequestRunning(false),
       fExpectedSize(0), fFfmpegThread(-1), fHlsFormatKnown(false),
       fLastHlsMetadataPoll(0), fLastPcmReadDebugLog(0),
-      fFfmpegReadDeadline(0), fPendingSeekTime(-1) {
+      fFfmpegReadDeadline(0), fPendingSeekTime(-1),
+      fTargetSampleRate(0.0f), fTargetChannels(0) {
   fDataReady = create_sem(0, "stream_data_ready");
   fHlsFormatReady = create_sem(0, "hls_format_ready");
   memset(&fHlsFormat, 0, sizeof(fHlsFormat));
+}
+
+void NetworkAudioStreamIO::SetTargetFormat(float sampleRate, int32 channels) {
+  fTargetSampleRate = sampleRate;
+  fTargetChannels = channels;
 }
 
 NetworkAudioStreamIO::~NetworkAudioStreamIO() {
@@ -1464,12 +1470,14 @@ void NetworkAudioStreamIO::_FfmpegLoop() {
 
   SwrContext *swr = nullptr;
   AVChannelLayout outLayout;
-  av_channel_layout_copy(&outLayout, &codecCtx->ch_layout);
+  int targetChannels = fTargetChannels > 0 ? fTargetChannels : codecCtx->ch_layout.nb_channels;
+  int targetRate = fTargetSampleRate > 0.0f ? (int)fTargetSampleRate : codecCtx->sample_rate;
+  av_channel_layout_default(&outLayout, targetChannels);
 
   int ret = swr_alloc_set_opts2(&swr,
                                 &outLayout,
                                 AV_SAMPLE_FMT_FLT,
-                                codecCtx->sample_rate,
+                                targetRate,
                                 &codecCtx->ch_layout,
                                 codecCtx->sample_fmt,
                                 codecCtx->sample_rate,
@@ -1487,8 +1495,8 @@ void NetworkAudioStreamIO::_FfmpegLoop() {
     return;
   }
 
-  fHlsFormat.frame_rate = codecCtx->sample_rate;
-  fHlsFormat.channel_count = codecCtx->ch_layout.nb_channels;
+  fHlsFormat.frame_rate = targetRate;
+  fHlsFormat.channel_count = targetChannels;
   fHlsFormat.format = media_raw_audio_format::B_AUDIO_FLOAT;
   fHlsFormat.byte_order = B_MEDIA_HOST_ENDIAN;
   fHlsFormat.buffer_size = 8192;

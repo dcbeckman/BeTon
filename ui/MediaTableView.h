@@ -32,13 +32,19 @@ public:
 
   /**
    * @brief Adds a single media item to the view.
+   * @param index Row index to insert at, or -1 to append.
    */
-  void AddEntry(const MediaItem &mi);
+  void AddEntry(const MediaItem &mi, int32 index = -1);
 
   /**
    * @brief Adds a list of items asynchronously (chunked).
    */
   void AddEntries(std::vector<MediaItem> items);
+
+  // Serialize/deserialize a MediaItem to/from a BMessage. Used to snapshot a
+  // row's data into an undo action so it can be reinserted without a rescan.
+  static void ArchiveItem(const MediaItem &mi, BMessage *out);
+  static MediaItem UnarchiveItem(const BMessage *in);
 
   void ClearEntries();
   void RefreshScrollbars();

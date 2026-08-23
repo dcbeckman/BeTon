@@ -3,6 +3,10 @@
 
 #include "Config.h"
 #include "Messages.h"
+#if ENABLE_LOCAL_OUTPUT
+#include "AudioOutputManager.h"
+#include "AudioResampler.h"
+#endif
 
 #include <Autolock.h>
 #include <Locker.h>
@@ -31,6 +35,71 @@
 class DLNAService;
 class LocalFileHttpServer;
 
+struct AudioRingBuffer {
+  std::vector<uint8> buffer;
+  size_t capacity = 0;
+  std::atomic<size_t> writeHead{0};
+  std::atomic<size_t> readHead{0};
+
+  void Init(size_t sizeBytes) {
+    buffer.resize(sizeBytes);
+    capacity = sizeBytes;
+    writeHead.store(0, std::memory_order_relaxed);
+    readHead.store(0, std::memory_order_relaxed);
+  }
+
+  size_t AvailableRead() const {
+    size_t w = writeHead.load(std::memory_order_acquire);
+    size_t r = readHead.load(std::memory_order_relaxed);
+    return (w >= r) ? (w - r) : (capacity - r + w);
+  }
+
+  size_t AvailableWrite() const {
+    size_t r = readHead.load(std::memory_order_relaxed);
+    size_t w = writeHead.load(std::memory_order_relaxed);
+    return (r > w) ? (r - w - 1) : (capacity - w + r - 1);
+  }
+
+  size_t Write(const uint8 *src, size_t count) {
+    size_t avail = AvailableWrite();
+    if (count > avail)
+      count = avail;
+    if (count == 0)
+      return 0;
+
+    size_t w = writeHead.load(std::memory_order_relaxed);
+    size_t firstPart = std::min(count, capacity - w);
+    memcpy(&buffer[w], src, firstPart);
+    if (count > firstPart) {
+      memcpy(&buffer[0], src + firstPart, count - firstPart);
+    }
+    writeHead.store((w + count) % capacity, std::memory_order_release);
+    return count;
+  }
+
+  size_t Read(uint8 *dst, size_t count) {
+    size_t avail = AvailableRead();
+    if (count > avail)
+      count = avail;
+    if (count == 0)
+      return 0;
+
+    size_t r = readHead.load(std::memory_order_relaxed);
+    size_t firstPart = std::min(count, capacity - r);
+    memcpy(dst, &buffer[r], firstPart);
+    if (count > firstPart) {
+      memcpy(dst + firstPart, &buffer[0], count - firstPart);
+    }
+    readHead.store((r + count) % capacity, std::memory_order_release);
+    return count;
+  }
+
+  void Reset() {
+    writeHead.store(0, std::memory_order_relaxed);
+    readHead.store(0, std::memory_order_relaxed);
+  }
+};
+
 class AudioPlaybackEngine {
 public:
   AudioPlaybackEngine();
@@ -38,6 +107,14 @@ public:
 
 #if ENABLE_DLNA_OUTPUT
   void SetRemoteOutputManagers(DLNAService *dlna, LocalFileHttpServer *localServer);
+#endif
+
+#if ENABLE_LOCAL_OUTPUT
+  void SetOutputDevice(OutputTarget target, const OutputBusInfo& bus, MixerConflictPolicy policy, const BString& fallbackDeviceName);
+  OutputTarget LocalOutputTarget() const { return fLocalOutputTarget; }
+  OutputBusInfo LocalOutputBus() const { return fLocalOutputBus; }
+  MixerConflictPolicy LocalConflictPolicy() const { return fLocalConflictPolicy; }
+  BString LocalFallbackDevice() const { return fLocalFallbackDevice; }
 #endif
 
   /**
@@ -110,6 +187,32 @@ private:
   void _BeginFadeOut();
   void _ApplyFade(void *buffer, size_t size,
                   const media_raw_audio_format &format);
+#if ENABLE_LOCAL_OUTPUT
+  /**
+   * @brief Fill @p buffer with resampled local-file audio (direct output).
+   *
+   * Reads native-format frames from fTrack and converts them to the device
+   * format via fResampler. Returns destination frames written (< wantFrames
+   * signals end of track).
+   */
+  int64 _FillResampled(void *buffer, int64 wantFrames, bool &hitEof);
+  // Capture the system mixer's master gain for direct-output loudness matching.
+  // Call when a direct connection is established (before the mixer is
+  // disconnected). Sets fMixerMasterDb + fDirectCompActive, then recomputes.
+  void _UpdateDirectGain();
+  // Recompute fDirectGain from fVolume + fMixerMasterDb, replicating the Haiku
+  // mixer's non-linear volume+master curve so direct matches mixer loudness.
+  // Call on any volume change and after _UpdateDirectGain.
+  void _RecomputeDirectGain();
+  // Warm the selected direct-output device in the background so the first
+  // Play() connects to an already-running node (no cold-start settle on the
+  // play path). Spawned from SetOutputDevice when nothing is playing.
+  void _SpawnPrime();
+  // Join any outstanding prime thread. Called before spawning a new one and
+  // before teardown so the thread never outlives the engine.
+  void _WaitForPrime();
+  static int32 _PrimeThreadEntry(void *arg);
+#endif
   status_t _StartMidiAt(int32 position);
   void _StopMidi(bool unload);
   void _SilenceMidi();
@@ -139,7 +242,10 @@ private:
   ///@{
   std::atomic<bigtime_t> fCurrentPos{0};
   bigtime_t fDuration = 0;
-  float fVolume = 1.0f;
+  // Atomic: read on the real-time audio thread (software volume in _ApplyFade)
+  // while written on the control thread. std::atomic<float> provides implicit
+  // load/store, so existing use-sites are unchanged.
+  std::atomic<float> fVolume{1.0f};
   std::atomic<int32> fCurrentBitrate{0};
   std::atomic<int32> fCurrentSampleRate{0};
   std::atomic<int32> fCurrentChannels{0};
@@ -158,9 +264,24 @@ private:
   std::atomic<bool> fShuttingDown{false};
   std::atomic<bool> fInCallback{false};
   std::atomic<bool> fStopping{false};
+  std::atomic<int32> fZeroReadCount{0};
   std::atomic<bool> fIsStreaming{false}; ///< True when playing a URL stream.
   class NetworkAudioStreamIO *fNetworkStream = nullptr;
   ///@}
+
+  AudioRingBuffer fPrebufferRing;
+  std::atomic<bool> fUsePrebuffer{false};
+  std::atomic<bool> fPrebufferRunning{false};
+  std::atomic<bool> fReaderEof{false};
+  thread_id fPrebufferThread = -1;
+  int fPrebufferFrameSize = 4; ///< Native decoded-track frame size (bytes);
+                                ///< set before the thread starts, read only
+                                ///< by that thread while it runs.
+
+  void _StartPrebufferThread(int frameSize);
+  void _StopPrebufferThread();
+  void _PrebufferThreadFunc();
+  static int32 _PrebufferThreadEntry(void *cookie);
 
   /** @name Notification */
   ///@{
@@ -170,6 +291,35 @@ private:
 
   BPrivate::Network::BUrlContext fUrlContext;
   BLocker fPlayLock;
+
+  BUrl fCurrentUrl;
+  BString fCurrentTitle;
+
+#if ENABLE_LOCAL_OUTPUT
+  AudioOutputManager fLocalOutputManager;
+  OutputTarget fLocalOutputTarget = OutputTarget::SystemDefault;
+  OutputBusInfo fLocalOutputBus;
+  MixerConflictPolicy fLocalConflictPolicy = MixerConflictPolicy::Disconnect;
+  BString fLocalFallbackDevice;
+  // Resamples native decoded frames to a direct device's negotiated format.
+  // Active only on the local-file direct path; passthrough/unset otherwise.
+  AudioResampler fResampler;
+  // Reusable source-frame scratch for _FillResampled, pre-sized in Play()
+  // so the audio callback does not allocate on the hot path.
+  std::vector<uint8> fResampleScratch;
+  // Direct-output loudness match. In direct mode Beton applies fDirectGain in
+  // software (in _ApplyFade). It replicates the Haiku mixer's TOTAL gain on
+  // Beton's stream — the mixer's non-linear volume curve plus the master gain,
+  // both of which a direct connection bypasses — so switching output modes
+  // does not change loudness. Read on the audio thread; recomputed on the
+  // control thread whenever fVolume or the captured master changes.
+  std::atomic<float> fDirectGain{1.0f};
+  std::atomic<float> fMixerMasterDb{0.0f};    // captured mixer master (displayed dB)
+  std::atomic<bool> fDirectCompActive{false}; // true once a direct connect succeeds
+  std::atomic<bool> fMixerAttenuate3dB{false}; // mixer's "-3 dB output" toggle state
+  // Background device-warm thread (see _SpawnPrime). -1 when none outstanding.
+  std::atomic<thread_id> fPrimeThread{-1};
+#endif
 
 #if ENABLE_DLNA_OUTPUT
   DLNAService *fDlnaManager = nullptr;

@@ -10,6 +10,9 @@ SRCS = \
     app/Main.cpp \
     app/MainWindow.cpp \
     app/UndoManager.cpp \
+    audio/AudioOutputManager.cpp \
+    audio/AudioResampler.cpp \
+    audio/OutputViewController.cpp \
     artwork/ArtworkController.cpp \
     dlna/DLNAMessageHandler.cpp \
     dlna/DLNAViewController.cpp \
@@ -67,6 +70,7 @@ LIBS = be translation tag tracker media midi columnlistview musicbrainz5 network
 LOCAL_INCLUDE_PATHS = \
     . \
     app \
+    audio \
     artwork \
     dlna \
     library \

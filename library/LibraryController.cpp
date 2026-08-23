@@ -11,14 +11,17 @@
 #include "MediaTableView.h"
 #include "StatusBarController.h"
 #include "UndoManager.h"
+#include <Alert.h>
 #include <Catalog.h>
 #include <Directory.h>
+#include <NumberFormat.h>
 #include <MessageRunner.h>
 #include <Entry.h>
 #include <Messenger.h>
 #include <OS.h>
 #include <Path.h>
 #include <Roster.h>
+#include <TextView.h>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -28,7 +31,7 @@
 #define B_TRANSLATION_CONTEXT "LibraryController"
 
 LibraryController::LibraryController(MainWindow* window) : fWindow(window) {}
-LibraryController::~LibraryController() {}
+LibraryController::~LibraryController() { _StopScanStatusTimer(); }
 
 /**
  * @brief Opens the directory/source management window.
@@ -192,6 +195,212 @@ void LibraryController::HandleCacheLoaded() {
 }
 
 /**
+ * @brief Rebuilds the library after a corrupt cache file was discarded.
+ *
+ * Recovering by hand used to mean deleting media.cache and then clicking every
+ * folder and playlist in the sidebar one at a time, which is neither obvious
+ * nor pleasant. This does the whole thing automatically:
+ *   - configured music sources and sidebar folders come back via a full scan
+ *     (MediaLibraryCache::StartScan reads both from the settings file);
+ *   - playlist tracks are queued explicitly, because a playlist may reference
+ *     files that live outside every scanned folder and would otherwise stay
+ *     bare filename-only rows.
+ */
+void LibraryController::HandleCacheCorrupt(BMessage *msg) {
+  int32 recovered = 0;
+  int32 declared = 0;
+  BString backupPath;
+  if (msg) {
+    msg->FindInt32("recovered", &recovered);
+    msg->FindInt32("declared", &declared);
+    msg->FindString("backup", &backupPath);
+  }
+
+  DEBUG_PRINT("MSG_CACHE_CORRUPT received (%ld entries salvaged), "
+              "rebuilding library\n",
+              (long)recovered);
+
+  if (recovered > 0) {
+    // The salvaged entries are already loaded and verified against disk, so
+    // the views must keep them: the scan below fast-skips those files and
+    // will not report them again.
+    BString status;
+    status.SetToFormat(
+        B_TRANSLATE("Media cache was damaged. Recovered %ld entries, "
+                    "scanning for the rest..."),
+        (long)recovered);
+    fWindow->UpdateStatus(status);
+  } else {
+    fWindow->UpdateStatus(
+        B_TRANSLATE("Media cache was damaged and has been discarded. "
+                    "Rebuilding library..."));
+
+    if (fWindow->fLibraryManager) {
+      fWindow->fLibraryManager->ContentView()->Clear();
+      fWindow->fLibraryManager->GenreView()->Clear();
+      fWindow->fLibraryManager->ArtistView()->Clear();
+      fWindow->fLibraryManager->AlbumView()->Clear();
+    }
+    fWindow->fAllItems.clear();
+    fWindow->fPathIndex.clear();
+  }
+
+  _ShowCacheDamagedAlert(recovered, declared, backupPath);
+  _StartLibraryRebuild();
+}
+
+void LibraryController::HandleCacheEmpty(BMessage *msg) {
+  int32 sources = 0;
+  if (msg)
+    msg->FindInt32("sources", &sources);
+
+  const int32 collections = _CountSidebarCollections();
+
+  DEBUG_PRINT("MSG_CACHE_EMPTY received (%ld sources, %ld sidebar "
+              "collections)\n",
+              (long)sources, (long)collections);
+
+  // A first run with nothing set up yet: an empty library is the correct
+  // answer, so do not launch a scan that has nothing to look at.
+  if (sources <= 0 && collections <= 0)
+    return;
+
+  fWindow->UpdateStatus(
+      B_TRANSLATE("No media cache found. Building the library..."));
+
+  _StartLibraryRebuild();
+}
+
+void LibraryController::_StartLibraryRebuild() {
+  if (!fWindow->fMediaLibraryCache)
+    return;
+
+  BMessenger cache(fWindow->fMediaLibraryCache);
+
+  // Start the folder scan first: the queued file paths below are only drained
+  // once the scanners are done, and anything they already recovered is
+  // skipped rather than read twice.
+  cache.SendMessage(MSG_RESCAN);
+
+  if (!fWindow->fPlaylistLibrary)
+    return;
+
+  BMessage names;
+  fWindow->fPlaylistLibrary->GetPlaylistNames(names, false);
+
+  // Each path carries the playlist it came from so the cache can report how
+  // many playlists actually hold work. Paths are deduplicated within a
+  // playlist but not across them: a track in two playlists is scanned once,
+  // yet both playlists count as having something to do.
+  BMessage scanFiles(MSG_SCAN_FILES);
+  int32 queued = 0;
+  BString plName;
+
+  for (int32 i = 0; names.FindString("name", i, &plName) == B_OK; ++i) {
+    std::set<BString> seen;
+    for (const auto &path : fWindow->fPlaylistLibrary->LoadPlaylist(plName)) {
+      if (path.IsEmpty() || path[0] != '/')
+        continue;
+      if (!seen.insert(path).second)
+        continue;
+      scanFiles.AddString("path", path);
+      scanFiles.AddInt32("playlist", i);
+      queued++;
+    }
+  }
+
+  if (queued == 0)
+    return;
+
+  cache.SendMessage(&scanFiles);
+
+  DEBUG_PRINT("Queued %ld playlist tracks for recaching\n", (long)queued);
+}
+
+int32 LibraryController::_CountSidebarCollections() const {
+  if (!fWindow->fPlaylistLibrary || !fWindow->fPlaylistLibrary->View())
+    return 0;
+
+  PlaylistSidebarView *sidebar = fWindow->fPlaylistLibrary->View();
+  int32 count = 0;
+
+  for (int32 i = 0; i < sidebar->CountItems(); ++i) {
+    const PlaylistItemKind kind = sidebar->KindAt(i);
+    if (kind == PlaylistItemKind::Folder || kind == PlaylistItemKind::Playlist)
+      count++;
+  }
+
+  return count;
+}
+
+void LibraryController::_ShowCacheDamagedAlert(int32 recovered, int32 declared,
+                                               const BString &backupPath) {
+  BString text;
+
+  if (recovered > 0) {
+    // Only quote a total when the damaged header actually gave us a credible
+    // one; on a badly mangled file it can be missing or lower than what was
+    // recovered, and "1522 of 0 entries" would just be confusing.
+    if (declared > recovered) {
+      text.SetToFormat(
+          B_TRANSLATE("Beton's media cache was damaged and could not be read "
+                      "in full.\n\n"
+                      "%ld of %ld entries were recovered and checked against "
+                      "the files on disk. The rest of the library is being "
+                      "rescanned now."),
+          (long)recovered, (long)declared);
+    } else {
+      text.SetToFormat(
+          B_TRANSLATE("Beton's media cache was damaged and could not be read "
+                      "in full.\n\n"
+                      "%ld entries were recovered and checked against the "
+                      "files on disk. The rest of the library is being "
+                      "rescanned now."),
+          (long)recovered);
+    }
+  } else {
+    text = B_TRANSLATE("Beton's media cache was damaged and could not be "
+                       "read.\n\n"
+                       "It has been discarded, and the library is being "
+                       "rebuilt by rescanning your music folders and "
+                       "playlists.");
+  }
+
+  text << "\n\n"
+       << B_TRANSLATE("You can keep using Beton while this runs.");
+
+  if (!backupPath.IsEmpty()) {
+    text << "\n\n"
+         << B_TRANSLATE("A copy of the damaged file has been kept, should you "
+                        "want to examine it:")
+         << "\n" << backupPath;
+  }
+
+  BAlert *alert =
+      new BAlert(B_TRANSLATE("Media cache damaged"), text.String(),
+                 B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL,
+                 B_WARNING_ALERT);
+  alert->SetShortcut(0, B_ESCAPE);
+
+  // BAlert's width_style only sizes the buttons, so the text view has to be
+  // widened by hand to keep the backup path on one line. Broken across lines
+  // at an arbitrary character it reads as a different filename than the one
+  // actually on disk. Capped so a deeply nested path cannot produce an alert
+  // wider than the screen.
+  if (!backupPath.IsEmpty()) {
+    if (BTextView *view = alert->TextView()) {
+      const float pathWidth = view->StringWidth(backupPath.String());
+      view->SetExplicitMinSize(
+          BSize(std::min(pathWidth + 16.0f, 700.0f), B_SIZE_UNSET));
+    }
+  }
+
+  // Asynchronous on purpose: the rebuild is already under way and this runs
+  // on the window's looper, so a modal Go() would freeze the UI behind it.
+  alert->Go(NULL);
+}
+
+/**
  * @brief Starts a complete rescan and clears current visible library content.
  */
 void LibraryController::StartFullRescan() {
@@ -210,31 +419,135 @@ void LibraryController::StartFullRescan() {
   fWindow->fStatusLabel->SetText(B_TRANSLATE("Rescan started..."));
 }
 
+/** @brief Formats a count with the locale's thousands separators. */
+static BString FormatCount(int32 value) {
+  BString out;
+  static BNumberFormat format;
+  if (format.Format(out, (int32)value) != B_OK)
+    out.SetToFormat("%ld", (long)value);
+  return out;
+}
+
+/** @brief Formats a duration as m:ss, or h:mm:ss once it runs past an hour. */
+static BString FormatDuration(int64 seconds) {
+  if (seconds < 0)
+    seconds = 0;
+
+  BString out;
+  const int64 hours = seconds / 3600;
+  const int64 minutes = (seconds % 3600) / 60;
+  const int64 secs = seconds % 60;
+
+  if (hours > 0) {
+    out.SetToFormat("%lld:%02lld:%02lld", (long long)hours,
+                    (long long)minutes, (long long)secs);
+  } else {
+    out.SetToFormat("%lld:%02lld", (long long)minutes, (long long)secs);
+  }
+  return out;
+}
+
 /**
  * @brief Updates status text while scan is running.
  */
 void LibraryController::UpdateScanProgress(BMessage *msg) {
-  int32 dirs = 0;
-  int32 files = 0;
+  if (msg->FindInt32("files_total", &fScanFilesTotal) != B_OK)
+    return;
+
+  msg->FindInt32("folders", &fScanFolders);
+  msg->FindInt32("playlists", &fScanPlaylists);
+  msg->FindInt32("files_done", &fScanFilesDone);
+
+  // Anchor the clock off the cache's elapsed figure so the label keeps
+  // counting between reports without drifting away from the real scan.
   int64 elapsedSec = 0;
-  if (msg->FindInt32("dirs", &dirs) == B_OK &&
-      msg->FindInt32("files", &files) == B_OK) {
+  msg->FindInt64("elapsed_sec", &elapsedSec);
+  fScanStartTime = system_time() - (bigtime_t)elapsedSec * 1000000;
 
-    msg->FindInt64("elapsed_sec", &elapsedSec);
+  _StartScanStatusTimer();
+  _RenderScanStatus();
+}
 
-    BString status;
-    if (elapsedSec > 0) {
-      int32 min = elapsedSec / 60;
-      int32 sec = elapsedSec % 60;
-      status.SetToFormat(B_TRANSLATE("Scanning: %ld folders, %ld"
-                                     " files (%02d:%02d)"),
-                         (long)dirs, (long)files, (int)min, (int)sec);
-    } else {
-      status.SetToFormat(B_TRANSLATE("Scanning: %ld folders, %ld files"),
-                         (long)dirs, (long)files);
-    }
-    fWindow->fStatusLabel->SetText(status.String());
+void LibraryController::TickScanStatus() { _RenderScanStatus(); }
+
+void LibraryController::_RenderScanStatus() {
+  if (!fWindow->fStatusLabel)
+    return;
+
+  if (fScanFilesTotal <= 0) {
+    fWindow->fStatusLabel->SetText(B_TRANSLATE("Checking for changes..."));
+    return;
   }
+
+  // Scope: fixed for the run, and omitted entirely when it would only say
+  // "0 Folders" — a playlist-only pass has no folders and vice versa.
+  BString scope;
+  if (fScanFolders > 0) {
+    scope.SetToFormat(B_TRANSLATE("%ld Folders"), (long)fScanFolders);
+  }
+  if (fScanPlaylists > 0) {
+    if (!scope.IsEmpty())
+      scope << ", ";
+    BString part;
+    part.SetToFormat(B_TRANSLATE("%ld Playlists"), (long)fScanPlaylists);
+    scope << part;
+  }
+
+  const int64 elapsedSec = (system_time() - fScanStartTime) / 1000000;
+  const int32 done = std::min(fScanFilesDone, fScanFilesTotal);
+
+  // Alternate the trailing label every five seconds.
+  const bool showRemaining = ((elapsedSec / 5) % 2) == 1;
+
+  BString tail;
+  if (showRemaining && done > 0) {
+    // Linear extrapolation. Every counted file is real work — files already
+    // cached were excluded from both figures — so the rate stays meaningful.
+    const int64 remainingSec =
+        (int64)((double)elapsedSec * (fScanFilesTotal - done) / done);
+    const int32 pct = (int32)(100.0 * (fScanFilesTotal - done) / fScanFilesTotal);
+    BString duration = FormatDuration(remainingSec);
+    tail.SetToFormat(B_TRANSLATE("Remaining ~%s (%ld%%)"), duration.String(),
+                     (long)pct);
+  } else {
+    const int32 pct = (int32)(100.0 * done / fScanFilesTotal);
+    BString duration = FormatDuration(elapsedSec);
+    tail.SetToFormat(B_TRANSLATE("Elapsed %s (%ld%%)"), duration.String(),
+                     (long)pct);
+  }
+
+  BString doneStr = FormatCount(done);
+  BString totalStr = FormatCount(fScanFilesTotal);
+
+  BString status;
+  if (scope.IsEmpty()) {
+    status.SetToFormat(B_TRANSLATE("Scanning %s/%s Files - %s"),
+                       doneStr.String(), totalStr.String(), tail.String());
+  } else {
+    status.SetToFormat(B_TRANSLATE("Scanning %s: %s/%s Files - %s"),
+                       scope.String(), doneStr.String(), totalStr.String(),
+                       tail.String());
+  }
+
+  fWindow->fStatusLabel->SetText(status.String());
+}
+
+void LibraryController::_StartScanStatusTimer() {
+  if (fScanStatusRunner != nullptr)
+    return;
+
+  BMessage tick(MSG_SCAN_TICK);
+  fScanStatusRunner =
+      new BMessageRunner(BMessenger(fWindow), &tick, 1000000, -1);
+  if (fScanStatusRunner->InitCheck() != B_OK) {
+    delete fScanStatusRunner;
+    fScanStatusRunner = nullptr;
+  }
+}
+
+void LibraryController::_StopScanStatusTimer() {
+  delete fScanStatusRunner;
+  fScanStatusRunner = nullptr;
 }
 
 /**
@@ -243,16 +556,25 @@ void LibraryController::UpdateScanProgress(BMessage *msg) {
 void LibraryController::HandleScanDone(BMessage *msg) {
   DEBUG_PRINT("MSG_SCAN_DONE received\n");
 
-  BString status;
-  int64 elapsedSec = 0;
-  msg->FindInt64("elapsed_sec", &elapsedSec);
+  // Individual scanners report as they finish, but only the cache's final
+  // message means the whole cycle is over. Retiring the live status on the
+  // first one would freeze it while the rest were still working.
+  if (msg->GetBool("final", false)) {
+    _StopScanStatusTimer();
 
-  int32 min = elapsedSec / 60;
-  int32 sec = elapsedSec % 60;
+    const int64 elapsedSec =
+        fScanStartTime > 0 ? (system_time() - fScanStartTime) / 1000000 : 0;
+    BString duration = FormatDuration(elapsedSec);
 
-  status.SetToFormat(B_TRANSLATE("Scan completed in %02d:%02d, %ld new files"),
-                     (int)min, (int)sec, (long)fWindow->fNewFilesCount);
-  fWindow->UpdateStatus(status.String(), false);
+    BString status;
+    status.SetToFormat(B_TRANSLATE("Scan completed in %s, %ld new files"),
+                       duration.String(), (long)fWindow->fNewFilesCount);
+    fWindow->UpdateStatus(status.String(), false);
+
+    fScanFilesDone = 0;
+    fScanFilesTotal = 0;
+    fScanStartTime = 0;
+  }
 
   if (fWindow->fMediaLibraryCache) {
     auto entries = fWindow->fMediaLibraryCache->AllEntries();
@@ -307,16 +629,9 @@ void LibraryController::HandleMediaBatch(BMessage *msg) {
     return;
 
   for (int32 i = 0; i < count; i++) {
-    BString pathStr;
-    if (msg->FindString("path", i, &pathStr) != B_OK)
-      continue;
-
-    BPath normPath(pathStr.String());
     BString path;
-    if (normPath.InitCheck() == B_OK)
-      path = normPath.Path();
-    else
-      path = pathStr;
+    if (msg->FindString("path", i, &path) != B_OK)
+      continue;
 
     bool isNewItem = false;
     MediaItem *itemToUpdate = nullptr;
@@ -357,7 +672,8 @@ void LibraryController::HandleMediaBatch(BMessage *msg) {
           fWindow->fLibraryManager ? fWindow->fLibraryManager->ContentView() : nullptr;
       if (cv) {
         if (isNewItem) {
-          if (fWindow->fIsLibraryMode) {
+          if (fWindow->fIsLibraryMode ||
+              (fWindow->fIsFolderMode && fWindow->fLibraryManager->IsPathAllowed(path, false))) {
             cv->AddEntry(*itemToUpdate);
           }
         } else {
@@ -394,66 +710,26 @@ void LibraryController::RefreshPartialViews() {
  * @brief Applies single-item updates from scanner/metadata changes.
  */
 void LibraryController::HandleMediaItemFound(BMessage *msg) {
-  BString pathStr;
-  if (msg->FindString("path", &pathStr) != B_OK) {
+  BString path;
+  if (msg->FindString("path", &path) != B_OK) {
     DEBUG_PRINT(
         "MSG_MEDIA_ITEM_FOUND path not found in message!\n");
     return;
   }
 
-  BPath normPath(pathStr.String());
-  BString path;
-  if (normPath.InitCheck() == B_OK)
-    path = normPath.Path();
-  else
-    path = pathStr;
-
-  DEBUG_PRINT("Item update path: '%s' (Normalized from '%s')\n",
-              path.String(), pathStr.String());
+  DEBUG_PRINT("Item update path: '%s'\n", path.String());
 
   MediaItem *itemToUpdate = nullptr;
   auto mapIt = fWindow->fPathIndex.find(path);
   bool isLibraryItem = (mapIt != fWindow->fPathIndex.end());
   if (isLibraryItem) {
     itemToUpdate = &fWindow->fAllItems[mapIt->second];
-  } else if (!fWindow->fIsFolderMode) {
+  } else {
     MediaItem newItem;
     newItem.path = path;
     fWindow->fAllItems.push_back(newItem);
     fWindow->fPathIndex[path] = fWindow->fAllItems.size() - 1;
     itemToUpdate = &fWindow->fAllItems.back();
-  }
-
-  // Folder-mode item not in library: apply update in-place without touching
-  // fAllItems, so no stale-comparison triggers a needless full view rebuild.
-  if (!itemToUpdate && fWindow->fIsFolderMode) {
-    MediaItem folderItem;
-    folderItem.path = path;
-    BString tmp;
-    int32 val;
-    if (msg->FindString("title", &tmp) == B_OK) folderItem.title = tmp;
-    if (msg->FindString("artist", &tmp) == B_OK) folderItem.artist = tmp;
-    if (msg->FindString("album", &tmp) == B_OK) folderItem.album = tmp;
-    if (msg->FindString("albumArtist", &tmp) == B_OK) folderItem.albumArtist = tmp;
-    if (msg->FindString("composer", &tmp) == B_OK) folderItem.composer = tmp;
-    if (msg->FindString("genre", &tmp) == B_OK) folderItem.genre = tmp;
-    if (msg->FindString("comment", &tmp) == B_OK) folderItem.comment = tmp;
-    if (msg->FindInt32("year", &val) == B_OK) folderItem.year = val;
-    if (msg->FindInt32("track", &val) == B_OK) folderItem.track = val;
-    if (msg->FindInt32("trackTotal", &val) == B_OK) folderItem.trackTotal = val;
-    if (msg->FindInt32("disc", &val) == B_OK) folderItem.disc = val;
-    if (msg->FindInt32("discTotal", &val) == B_OK) folderItem.discTotal = val;
-    if (msg->FindInt32("rating", &val) == B_OK) folderItem.rating = val;
-    if (msg->FindInt32("duration", &val) == B_OK) folderItem.duration = val;
-    if (msg->FindInt32("bitrate", &val) == B_OK) folderItem.bitrate = val;
-    if (fWindow->fLibraryManager) {
-      fWindow->fLibraryManager->UpdateActiveItem(folderItem);
-      if (fWindow->fLibraryManager->ContentView())
-        fWindow->fLibraryManager->ContentView()->UpdateItem(folderItem);
-    }
-    if (fWindow->fMetadataPropertiesWindow)
-      fWindow->fMetadataPropertiesWindow->PostMessage(msg);
-    return;
   }
 
   if (!itemToUpdate) {
@@ -524,8 +800,16 @@ void LibraryController::HandleMediaItemFound(BMessage *msg) {
 
   if (fWindow->fLibraryManager) {
     fWindow->fLibraryManager->UpdateActiveItem(*itemToUpdate);
-    if (fWindow->fLibraryManager->ContentView())
-      fWindow->fLibraryManager->ContentView()->UpdateItem(*itemToUpdate);
+    if (fWindow->fLibraryManager->ContentView()) {
+      if (isLibraryItem) {
+        fWindow->fLibraryManager->ContentView()->UpdateItem(*itemToUpdate);
+      } else {
+        if (fWindow->fIsLibraryMode ||
+            (fWindow->fIsFolderMode && fWindow->fLibraryManager->IsPathAllowed(path, false))) {
+          fWindow->fLibraryManager->ContentView()->AddEntry(*itemToUpdate);
+        }
+      }
+    }
   }
 
   if (fWindow->fMetadataPropertiesWindow)
@@ -534,8 +818,18 @@ void LibraryController::HandleMediaItemFound(BMessage *msg) {
   if (needsFullRefresh) {
     DEBUG_PRINT("Scheduling debounced view refresh for %s...\n",
                 itemToUpdate->title.String());
+
+    // Keep Folder rows pinned. A full refresh rebuilds the content list and
+    // re-applies the sort column, so editing the very field the view is sorted
+    // by (Fast Edit on Artist while sorted by Artist) yanks the row to a new
+    // position under the cursor. The row was already updated in place above, so
+    // only the genre/artist/album filter lists still need rebuilding — and the
+    // partial refresh does exactly that, leaving the content list (and with it
+    // the row order and scroll position) untouched. Playlist mode has its own
+    // lock via the position column; Library mode keeps re-sorting as before.
+    BMessage refresh(fWindow->fIsFolderMode ? MSG_VIEWS_REFRESH_PARTIAL
+                                            : MSG_VIEWS_REFRESH);
     delete fWindow->fViewsRefreshRunner;
-    BMessage refresh(MSG_VIEWS_REFRESH);
     fWindow->fViewsRefreshRunner =
         new BMessageRunner(BMessenger(fWindow), &refresh, 200000, 1);
   }

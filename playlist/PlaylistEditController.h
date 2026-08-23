@@ -7,6 +7,8 @@
 
 class MainWindow;
 class BFilePanel;
+class MediaTableView;
+class BRow;
 
 class PlaylistEditController {
 public:
@@ -38,6 +40,12 @@ public:
                              std::vector<BString> &outPaths);
 
 private:
+  // Drop the given rows from the content view directly, without re-reading the
+  // whole folder from disk. Used in Folder mode after files are moved/trashed
+  // out of the folder (there is no playlist file to rewrite, and a full
+  // disk re-read is slow).
+  void _RemoveRowsFromView(MediaTableView *cv, const std::vector<BRow *> &rows);
+
   MainWindow *fWindow;
   BMessage fPendingPlaylistFiles;
 };
