@@ -43,6 +43,7 @@
 
 #include <AboutWindow.h>
 #include <Alert.h>
+#include <AppFileInfo.h>
 #include <Autolock.h>
 #include <Button.h>
 #include <ColumnTypes.h>
@@ -170,6 +171,32 @@ bool MainWindow::_HandleMetadataMessage(BMessage *msg) {
 
 void MainWindow::_ShowAboutWindow() {
   BAboutWindow *about = new BAboutWindow("Beton", "application/x-vnd.Beton");
+
+  // Take the version from the binary that is actually running.
+  //
+  // Left to itself, BAboutWindow resolves the version through
+  // be_roster->FindApp(signature) (AboutView::_GetVersionFromSignature), which
+  // consults the MIME database's app hint (META:PPATH) and only falls back to a
+  // cross-volume query. Nothing validates that the hint still points at this
+  // binary, so with another Beton on any mounted volume -- a second install, an
+  // old build tree -- the About box reports THAT one's version. Observed on a
+  // machine with a dev volume mounted: an installed 1.3.1 reported "Version 1.2"
+  // from a stale build's app_version resource. GetAppInfo() gives us our own
+  // entry_ref directly, with no signature lookup to go wrong.
+  app_info info;
+  if (be_app->GetAppInfo(&info) == B_OK) {
+    BFile file(&info.ref, B_READ_ONLY);
+    BAppFileInfo appFileInfo;
+    version_info version;
+    if (file.InitCheck() == B_OK && appFileInfo.SetTo(&file) == B_OK &&
+        appFileInfo.GetVersionInfo(&version, B_APP_VERSION_KIND) == B_OK) {
+      BString versionString;
+      versionString << B_TRANSLATE("Version") << " " << version.major << "."
+                    << version.middle << "." << version.minor;
+      about->SetVersion(versionString.String());
+    }
+  }
+
   about->AddCopyright(2025, "Daniel Weber");
   about->AddDescription("A music library manager and player for Haiku.\n\n"
                         "Solid grey and cold\nYet it vibrates with the "
