@@ -8,9 +8,13 @@
 # satisfied by ANY ffmpeg generation, giving a package that resolves cleanly
 # and then fails to load against the wrong soname.
 #
-# ⚠️ These are the FFMPEG8 values, verified against the 1.3.0-2 binary on
-# hrev59866+53: libavcodec.so.62, libavformat.so.62, libavutil.so.60,
-# libswresample.so.6, plus libtag.so.1 and libmusicbrainz5.so.1.
+# ⚠️ These are the FFMPEG8 values, verified with readelf -d against the
+# 1.3.0-2 binary on hrev59866+53: libavcodec.so.62, libavformat.so.62,
+# libavutil.so.60, libswresample.so.6, plus libtag.so.1 and libmusicbrainz5.so.1.
+# Carried forward to 1.3.1 unchanged, which is safe ONLY because v1.3.1 is a
+# two-line edit to Beton.rdef's app_version resource (upstream e29cf79) and
+# touches no source file, no Makefile and no dependency. Re-verify on any
+# upstream release that is not purely a resource bump.
 #
 # 1.3.0-1 carried the ffmpeg6 generation instead (avcodec/avformat 60,
 # avutil 58, swresample 4). That was an accident of which ffmpeg*_devel was

@@ -25,12 +25,16 @@ OUTDIR="$PKGDIR/out"
 # Bump the revision (not the base) when the packaging changes but the source
 # does not -- a rebuilt package with identical contents and the same version
 # is indistinguishable to pkgman, so clients never pick it up.
-VERSION_BASE="1.3.0"
-# -2: rebuilt against ffmpeg8 (2026-08-29). -1 was linked against ffmpeg6
-# purely because ffmpeg6_devel happened to be the devel package installed on
-# the build box; upstream has shipped ffmpeg8 since the 1.2.0 recipe and has
-# never used ffmpeg6.
-REVISION="2"
+VERSION_BASE="1.3.1"
+# Revision resets to 1 on an upstream version bump -- it counts OUR packaging
+# iterations of a given upstream version, not builds overall.
+#
+# History worth keeping: 1.3.0-1 was linked against ffmpeg6, purely because
+# ffmpeg6_devel happened to be the devel package installed on the build box.
+# Upstream has declared ffmpeg8 since the 1.2.0 recipe and has never used
+# ffmpeg6. 1.3.0-2 corrected that; see the clean-build note below for why the
+# correction needed a from-scratch rebuild to take effect.
+REVISION="1"
 VERSION="$VERSION_BASE-$REVISION"
 
 APPNAME="Beton"
