@@ -17,6 +17,21 @@
 # kernel drivers; this ships ordinary userland apps. They share the `hpkg`
 # bucket and the hpkg.indispensablelabs.com domain, but nothing else -- a
 # different key prefix, a different identifier, a different name.
+#
+# ---------------------------------------------------------------------------
+# ⚠️ THIS FILE IS SHARED BY EVERY APP THAT PUBLISHES INTO THIS REPOSITORY
+# ---------------------------------------------------------------------------
+#
+# It lives in identical form in each app's packaging/ directory -- as of
+# 2026-08-29 that is BeTon/packaging/repo-info.in and
+# MidiMonitor2/packaging/repo-info.in. There is one repo.info object in the
+# bucket and publish-repo.sh overwrites it, so whichever app publishes LAST
+# decides what every subscriber sees. Divergent copies would make the
+# repository's own description flip-flop with each release.
+#
+# Keep the copies byte-identical -- `diff` them before a release -- and change
+# every copy in the same commit. The publish is not gated on this; nothing but
+# this comment enforces it.
 
 # ⚠️ MUST BE QUOTED. This is driver_settings format, where an unquoted value
 # ends at the first whitespace -- an unquoted `Indispensable Labs` parses as the

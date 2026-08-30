@@ -28,6 +28,18 @@
 # `apps/...` is a key prefix inside it -- exactly as `media-os/...` is for the
 # Media-OS repository. The two repositories share the bucket, the domain and
 # the R2 token, and share nothing else.
+#
+# ---------------------------------------------------------------------------
+# THIS PUBLISHES THE WHOLE REPOSITORY, NOT JUST BETON
+# ---------------------------------------------------------------------------
+#
+# The apps repository holds more than one app (Beton and MidiMonitor as of
+# 2026-08-29) and there is one shared index. build-repo.sh assembles that index
+# from packaging/out/ plus everything already published, so out-repo/ is the
+# complete repository and this script replaces the live one with it. Do not run
+# this against an out-repo/ built with --no-pull unless dropping the other apps
+# is what you actually mean to do. The `--prune` step below is what makes such
+# a mistake irreversible.
 
 set -e
 
@@ -162,6 +174,9 @@ if [ "$FAIL" = "0" ]; then
 	echo "Published. Users add it once with:"
 	echo "    pkgman add-repo $BASEURL"
 	echo "    pkgman install beton"
+	echo
+	echo "Everything the index now carries:"
+	awk '{ printf "    %s\n", $2 }' "$SRC/SHA256SUMS"
 else
 	echo "PUBLISH VERIFICATION FAILED -- see above." >&2
 	exit 1
