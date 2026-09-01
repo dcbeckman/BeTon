@@ -84,10 +84,29 @@ baseurl			@BASEURL@
 
 # Lower number = higher precedence: LibsolvSolver.cpp:748 sets
 # `repo->priority = -1 - Priority()`, and libsolv prefers the larger value.
-# Haiku and HaikuPorts both publish 1. 50 is BRepositoryInfo's default and the
-# correct choice for a third party: it must never outrank the official
-# repositories on a name collision.
-priority		50
+# Haiku and HaikuPorts both publish 1. 50 is BRepositoryInfo's DEFAULT
+# (RepositoryInfo.cpp:29) -- not a value anyone chose -- and it places a
+# repository BELOW the official ones, not above.
+#
+# ⚠️ CHANGED 50 -> 1 on 2026-09-01, deliberately reversing the rule this comment
+# used to state ("it must never outrank the official repositories on a name
+# collision"). That rule assumed we would never collide. We do: `beton` also
+# exists in HaikuPorts, and at 50 every HaikuDepot update replaced this build
+# with theirs REGARDLESS OF VERSION -- priority is evaluated before version, so
+# publishing a higher version could not help.
+#
+# 1 MATCHES HaikuPorts rather than beating it, and that is the point: an equal
+# priority makes libsolv fall through to version comparison, so this repository
+# wins only where it actually ships something newer, on merit. 0 would win
+# outright but collides with BRepositoryConfig::kUnsetPriority, and winning every
+# tie unconditionally is not what we want.
+#
+# ⚠️ The trade the old comment warned about is now REAL: any package here that
+# shares a name with a HaikuPorts one is settled by version, not by whose it is.
+# Keep package names deliberate. The durable fix for `beton` specifically is a
+# distinct package name at the Concrete-DJ fork, after which this can return
+# to 50.
+priority		1
 
 # Must be a concrete architecture -- `any` is explicitly rejected
 # (RepositoryInfo.cpp:395-397). Arch-independent packages still live in an
